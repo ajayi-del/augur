@@ -40,7 +40,16 @@ class Settings(BaseSettings):
     jupiter_ws_url: str   = "wss://api.jup.ag/v6/ws"
     jupiter_mode: str     = Field(default="paper", env="JUPITER_MODE")
 
-    # Bybit (no key in paper mode)
+    # MEXC (primary execution venue)
+    mexc_api_key: str                 = Field(default="", env="MEXC_API_KEY")
+    mexc_secret_key: str              = Field(default="", env="MEXC_SECRET_KEY")
+    mexc_futures_leverage: int        = Field(default=5,     env="MEXC_FUTURES_LEVERAGE")
+    mexc_max_position_usdt: float     = Field(default=200.0, env="MEXC_MAX_POSITION_USDT")
+    mexc_prediction_bankroll: float   = Field(default=50.0,  env="MEXC_PREDICTION_BANKROLL")
+    mexc_prediction_max_bet_pct: float = Field(default=0.05, env="MEXC_PREDICTION_MAX_BET_PCT")
+    mexc_min_prediction_edge: float   = Field(default=0.08,  env="MEXC_MIN_PREDICTION_EDGE")
+
+    # Bybit (fallback venue)
     bybit_api_key: str    = Field(default="", env="BYBIT_API_KEY")
     bybit_api_secret: str = Field(default="", env="BYBIT_API_SECRET")
     bybit_mode: str       = Field(default="paper", env="BYBIT_MODE")
@@ -62,15 +71,19 @@ class Settings(BaseSettings):
     risk_pct: float         = 0.01
     news_poll_interval_s: int = 300
 
-    # Tracked markets
+    # Tracked markets — alts + meme coins, no stocks
     watched_markets: List[str] = [
-        "SOL-PERP", "JUP-PERP", "JTO-PERP", "WIF-PERP",
-        "DRIFT-PERP", "KMNO-PERP", "PYTH-PERP", "W-PERP",
-        "BONK-PERP", "HYPE-PERP", "ENA-PERP", "BOME-PERP"
+        "SOL-PERP", "DOGE-PERP", "WIF-PERP", "BONK-PERP",
+        "TRUMP-PERP", "PEPE-PERP", "SUI-PERP", "ARB-PERP",
+        "OP-PERP", "MNT-PERP", "EDGE-PERP",
+        "CHILLGUY-PERP", "PIPPIN-PERP", "PIEVERSE-PERP",
+        "AVAX-PERP", "BNB-PERP", "HYPE-PERP", "ENA-PERP",
     ]
     news_assets: List[str] = [
-        "SOL", "JUP", "JTO", "WIF", "DRIFT", "KMNO",
-        "PYTH", "W", "BONK", "HYPE", "ENA", "BOME"
+        "SOL", "DOGE", "WIF", "BONK", "TRUMP", "PEPE",
+        "SUI", "ARB", "OP", "MNT", "EDGE",
+        "CHILLGUY", "PIPPIN", "PIEVERSE",
+        "AVAX", "BNB", "HYPE", "ENA",
     ]
 
     class Config:
