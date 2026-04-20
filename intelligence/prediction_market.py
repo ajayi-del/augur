@@ -132,14 +132,14 @@ class CrossAgentBetEngine:
                 independence_factor=0.0
             )
             
-        # Case: single agent
+        # Case: single agent — indep=0.5 (neutral, not zero) for fairer reporting
         if aria_bet is None:
             score = augur_bet.confidence * 5.0
-            return self._build_resolution(symbol, augur_bet, None, score, "single_augur")
-            
+            return self._build_resolution(symbol, augur_bet, None, score, "single_augur", indep=0.5)
+
         if augur_bet is None:
             score = aria_bet.confidence * 5.0
-            return self._build_resolution(symbol, None, aria_bet, score, "single_aria")
+            return self._build_resolution(symbol, None, aria_bet, score, "single_aria", indep=0.5)
             
         # Case: both have bets
         if aria_bet.direction != augur_bet.direction:

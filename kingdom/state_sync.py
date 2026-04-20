@@ -53,6 +53,9 @@ class KingdomState:
     aria: AriaState = field(default_factory=AriaState)
     augur: AugurState = field(default_factory=AugurState)
     finance: Dict = field(default_factory=dict)
+    # Shared position registry: {"aria": [...], "augur": [...]}
+    # Each entry: {symbol, direction, size_usd, venue, opened_ms}
+    position_registry: Dict = field(default_factory=dict)
     version: str = "2.0"
 
 
@@ -93,6 +96,7 @@ class KingdomStateSync:
                     aria=AriaState(**{k: v for k, v in aria_raw.items() if k in aria_fields}),
                     augur=AugurState(**{k: v for k, v in augur_raw.items() if k in augur_fields}),
                     finance=data.get("finance", {}),
+                    position_registry=data.get("position_registry", {}),
                     version=data.get("version", "2.0"),
                 )
         except Exception as e:
@@ -127,6 +131,62 @@ class KingdomStateSync:
         return self.read().finance
 
     # ── Write ───────────────────────────────────────────────────────────────
+
+    def write_position(
+        self,
+        agent_id: str,
+        symbol: str,
+        direction: str,
+        size_usd: float,
+        venue: str,
+    ) -> None:
+        """Register an open position in the shared registry."""
+        try:
+            with self.lock:
+                current: Dict = {}
+                if self.state_path.exists() and self.state_path.stat().st_size > 0:
+                    try:
+                        with open(self.state_path, "r") as f:
+                            current = json.load(f)
+                    except json.JSONDecodeError:
+                        current = {}
+
+                registry: Dict = current.get("position_registry", {})
+                positions: list = registry.get(agent_id, [])
+
+                # Evict entries older than 4 hours
+                now_ms = int(time.time() * 1000)
+                positions = [p for p in positions if now_ms - p.get("opened_ms", 0) < 4 * 3600 * 1000]
+
+                positions.append({
+                    "symbol":    symbol,
+                    "direction": direction,
+                    "size_usd":  size_usd,
+                    "venue":     venue,
+                    "opened_ms": now_ms,
+                })
+                registry[agent_id] = positions
+                current["position_registry"] = registry
+                current["version"] = "2.0"
+
+                tmp = self.state_path.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(current, f, indent=2)
+                tmp.replace(self.state_path)
+                logger.debug("position_registered", agent=agent_id, symbol=symbol)
+        except Exception as e:
+            logger.error("write_position_error", error=str(e))
+
+    def count_open_positions(self, agent_id: str) -> int:
+        """Returns the number of tracked open positions for an agent."""
+        try:
+            state = self.read()
+            registry = state.position_registry
+            positions = registry.get(agent_id, [])
+            now_ms = int(time.time() * 1000)
+            return sum(1 for p in positions if now_ms - p.get("opened_ms", 0) < 4 * 3600 * 1000)
+        except Exception:
+            return 0
 
     def write_augur_state(self, augur: AugurState) -> None:
         self._update_section("augur", asdict(augur))

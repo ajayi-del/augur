@@ -101,8 +101,23 @@ class ValueChainBridge:
                             if resp.status != 200:
                                 continue
                             data = await resp.json(content_type=None)
-                            # API returns a list ordered newest-first
-                            records = data if isinstance(data, list) else data.get("records", [])
+
+                            logger.debug("drift_raw_response", symbol=symbol, idx=idx,
+                                         type=type(data).__name__,
+                                         keys=list(data.keys()) if isinstance(data, dict) else "list",
+                                         len=len(data) if isinstance(data, (list, dict)) else "?")
+
+                            # API format varies — try multiple shapes
+                            records = (
+                                data if isinstance(data, list)
+                                else data.get("records")
+                                or data.get("fundingRateRecords")
+                                or data.get("data", {}).get("fundingRateRecords")
+                                or data.get("data")
+                                or []
+                            )
+                            if isinstance(records, dict):
+                                records = list(records.values())
                             if not records:
                                 continue
                             rate_raw = float(records[0].get("fundingRate", 0.0))

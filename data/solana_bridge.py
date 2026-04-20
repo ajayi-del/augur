@@ -19,12 +19,25 @@ from typing import Dict, Optional
 logger = structlog.get_logger(__name__)
 
 _SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
-_JUPITER_V6     = "https://api.jup.ag/price/v2"    # primary (v4 domain unreliable)
-_JUPITER_V4     = "https://price.jup.ag/v4/price"  # fallback
-_JUP_IDS        = "SOL,BTC,ETH,BONK"
+_COINGECKO_URL  = "https://api.coingecko.com/api/v3/simple/price"
+
+# CoinGecko ID → canonical symbol
+_COINGECKO_IDS: Dict[str, str] = {
+    "solana":           "SOL",
+    "bitcoin":          "BTC",
+    "ethereum":         "ETH",
+    "dogecoin":         "DOGE",
+    "sui":              "SUI",
+    "arbitrum":         "ARB",
+    "optimism":         "OP",
+    "avalanche-2":      "AVAX",
+    "bnb":              "BNB",
+    "pepe":             "PEPE",
+    "bonk":             "BONK",
+}
 
 _TPS_CACHE_TTL   = 60    # seconds
-_PRICE_CACHE_TTL = 15    # seconds
+_PRICE_CACHE_TTL = 30    # seconds (CoinGecko free tier: 30 req/min)
 
 _HIGH_TPS_THRESHOLD = 3000   # strong network activity above this
 _DIV_THRESHOLD_PCT  = 0.30   # minimum divergence to flag arbitrage
@@ -77,52 +90,42 @@ class SolanaBridge:
             logger.warning("solana_tps_error", error=str(e))
         return 0.0
 
-    # ── Jupiter DEX prices ────────────────────────────────────────────────────
+    # ── CoinGecko market prices ───────────────────────────────────────────────
 
     async def get_jupiter_prices(self) -> Dict[str, float]:
         """
-        {symbol: usd_price} from Jupiter price API.
-        Tries v4 first, falls back to v6 format on failure.
+        {symbol: usd_price} from CoinGecko simple price API.
+        Replaces Jupiter (jup.ag DNS fails on GCP Frankfurt).
+        Returns empty dict on error — callers must handle gracefully.
         """
         if time.time() - self._price_cached_at < _PRICE_CACHE_TTL and self._price_cache:
             return dict(self._price_cache)
 
         prices: Dict[str, float] = {}
+        ids_str = ",".join(_COINGECKO_IDS.keys())
 
-        # Try Jupiter v6 (primary — api.jup.ag resolves better on GCP)
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
                 async with s.get(
-                    _JUPITER_V6,
-                    params={"ids": _JUP_IDS, "showExtraInfo": "false"},
+                    _COINGECKO_URL,
+                    params={"ids": ids_str, "vs_currencies": "usd"},
                 ) as r:
                     if r.status == 200:
                         data = await r.json(content_type=None)
-                        for sym, info in (data.get("data") or {}).items():
-                            p = float(info.get("price", 0.0))
+                        for cg_id, sym in _COINGECKO_IDS.items():
+                            entry = data.get(cg_id, {})
+                            p = float(entry.get("usd", 0.0))
                             if p > 0:
                                 prices[sym] = p
+                    else:
+                        logger.warning("coingecko_non_200", status=r.status)
         except Exception as e:
-            logger.warning("jupiter_v6_error", error=str(e))
-
-        # Fallback to v4 if v6 returned nothing
-        if not prices:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-                    async with s.get(_JUPITER_V4, params={"ids": _JUP_IDS}) as r:
-                        if r.status == 200:
-                            data = await r.json(content_type=None)
-                            for sym, info in (data.get("data") or {}).items():
-                                p = float(info.get("price", 0.0))
-                                if p > 0:
-                                    prices[sym] = p
-            except Exception as e:
-                logger.warning("jupiter_v4_error", error=str(e))
+            logger.warning("coingecko_price_error", error=str(e))
 
         if prices:
-            self._price_cache    = prices
+            self._price_cache     = prices
             self._price_cached_at = time.time()
-            logger.debug("jupiter_prices_fetched", symbols=list(prices.keys()))
+            logger.debug("coingecko_prices_fetched", symbols=list(prices.keys()))
 
         return dict(prices)
 

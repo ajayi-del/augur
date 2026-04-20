@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     min_coherence: float    = 5.0
     risk_pct: float         = 0.01
     news_poll_interval_s: int = 300
+    max_open_trades: int    = 4   # AUGUR global position cap
 
     # Tracked markets — alts + meme coins, no stocks
     watched_markets: List[str] = [
