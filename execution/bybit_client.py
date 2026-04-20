@@ -128,19 +128,28 @@ class BybitClient:
     async def get_balance(self) -> float:
         if self.mode == "paper":
             return 150.0
-        try:
-            resp = await self._get(
-                "/v5/account/wallet-balance", {"accountType": "UNIFIED"}
-            )
-            coins = (
-                resp.get("result", {}).get("list", [{}])[0].get("coin", [])
-            )
-            for c in coins:
-                if c.get("coin") == "USDT":
-                    raw = c.get("availableToWithdraw") or "0"
-                    return float(raw)
-        except Exception as e:
-            logger.warning("bybit_balance_error", error=str(e))
+        # Try CONTRACT (classic derivatives) first, then UNIFIED (UTA)
+        for account_type in ("CONTRACT", "UNIFIED"):
+            try:
+                resp = await self._get(
+                    "/v5/account/wallet-balance", {"accountType": account_type}
+                )
+                coins = (
+                    resp.get("result", {}).get("list", [{}])[0].get("coin", [])
+                )
+                for c in coins:
+                    if c.get("coin") == "USDT":
+                        # equity covers funds in open positions; walletBalance is total
+                        raw = (c.get("equity") or c.get("walletBalance")
+                               or c.get("availableToWithdraw") or "0")
+                        bal = float(raw)
+                        if bal > 0:
+                            logger.debug("bybit_balance_fetched",
+                                         account_type=account_type, usdt=round(bal, 2))
+                            return bal
+            except Exception as e:
+                logger.warning("bybit_balance_error",
+                               account_type=account_type, error=str(e))
         return 0.0
 
     # ── Execution ─────────────────────────────────────────────────────────────
