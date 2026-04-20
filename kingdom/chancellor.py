@@ -79,8 +79,7 @@ class Chancellor:
         "conflict_size_penalty":    0.20,
         "veto_drawdown_threshold":  0.08,
         "veto_extreme_cascade_z":   5.0,
-        "emergency_halt_balance":   10.0,   # absolute minimum floor
-        "emergency_halt_pct":       0.10,   # dynamic: max(floor, balance * pct)
+        "emergency_halt_balance":   0.0,    # no floor — Chancellor never halts on balance alone
     }
 
     def adjudicate(
@@ -102,13 +101,7 @@ class Chancellor:
         """
         c = self.CONSTITUTION
 
-        # Emergency veto — dynamic floor: max($50, 10% of balance)
-        halt_floor = max(c["emergency_halt_balance"],
-                         balance * c["emergency_halt_pct"])
-        if balance < halt_floor:
-            return self._veto_log("balance_below_floor",
-                                  balance=round(balance, 2),
-                                  floor=round(halt_floor, 2))
+        # Balance veto disabled — AUGUR runs and signals until funded
         if daily_loss_pct > c["max_daily_loss_pct"]:
             return self._veto_log("daily_loss_limit_breached",
                                   daily_loss_pct=round(daily_loss_pct, 4))

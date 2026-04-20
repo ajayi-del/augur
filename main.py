@@ -52,13 +52,11 @@ from memory.augur_hist_wr import augur_hist_wr
 from memory.outcome_resolver import OutcomeResolver
 from memory.cross_agent_feedback import CrossAgentFeedback
 from memory.cross_learning import CrossLearningEngine
-from execution.venues.mexc_client import MexcClient
 from execution.bybit_client import BybitClient
 from execution.routing_client import RoutingClient
 
 logger = structlog.get_logger()
 
-_POLY_JOURNAL  = Path(settings.augur_log_path) / "polymarket_journal.jsonl"
 _AUGUR_JOURNAL = Path(settings.augur_log_path) / "augur_journal.jsonl"
 
 # Execution gate thresholds
@@ -114,22 +112,13 @@ class AugurApplication:
         # news_assets are bare symbols ("SOL") — feed expects "SOL-USD" format
         self.bybit_feed = BybitFeed(symbols=[f"{s}-USD" for s in cfg.news_assets])
 
-        # Execution layer — Bybit primary (MEXC geo-blocked on GCP Frankfurt)
-        self.mexc = MexcClient(
-            api_key=cfg.mexc_api_key,
-            secret=cfg.mexc_secret_key,
-            leverage=min(cfg.mexc_futures_leverage, 5),
-            max_position_usdt=cfg.mexc_max_position_usdt,
-            prediction_bankroll=cfg.mexc_prediction_bankroll,
-            prediction_max_bet_pct=cfg.mexc_prediction_max_bet_pct,
-        )
+        # Execution layer — Bybit only
         self.bybit = BybitClient(
             mode="live" if self._is_live else "paper",
             api_key=cfg.bybit_api_key,
             api_secret=cfg.bybit_api_secret,
         )
         self.router = RoutingClient(
-            mexc=self.mexc,
             bybit=self.bybit,
             mode="live" if self._is_live else "paper",
         )
@@ -740,81 +729,6 @@ class AugurApplication:
             except Exception as e:
                 logger.error("kingdom_sync_error", error=str(e))
 
-    # ── Phase 4: MEXC prediction markets ──────────────────────────────────────
-
-    async def mexc_prediction_loop(self) -> None:
-        """Every 300s — scan MEXC prediction markets for edges."""
-        logger.info("mexc_prediction_loop_started", interval_s=300)
-        min_edge = self.config.mexc_min_prediction_edge
-
-        while True:
-            try:
-                markets = await self.mexc.get_prediction_markets()
-                if not markets:
-                    await asyncio.sleep(300)
-                    continue
-
-                aria_coherence = self.bridge.get_aria_coherence("BTC-USD")
-                tps_mult       = self._solana_snapshot.get("tps_multiplier", 1.0)
-                placed         = 0
-
-                for market in markets[:50]:
-                    try:
-                        yes_price = float(market.get("yesPrice", market.get("yes_price", 0.5)))
-                        market_id = market.get("marketId") or market.get("id", "")
-                        question  = market.get("question", market.get("title", ""))
-
-                        if not market_id or yes_price <= 0 or yes_price >= 1:
-                            continue
-
-                        if aria_coherence and self._regime in ("bull", "risk_on"):
-                            p_augur = min(yes_price + 0.12 * tps_mult, 0.95)
-                        elif self._regime in ("bear", "risk_off", "liquidation"):
-                            p_augur = max(yes_price - 0.12 * tps_mult, 0.05)
-                        else:
-                            continue
-
-                        edge = abs(p_augur - yes_price)
-                        if edge < min_edge:
-                            continue
-
-                        outcome   = "YES" if p_augur > yes_price else "NO"
-                        size_usdt = round(
-                            self.mexc.prediction_bankroll * self.mexc.max_bet_pct, 2
-                        )
-                        entry = {
-                            "event":        "prediction_signal",
-                            "market_id":    market_id,
-                            "question":     question[:80],
-                            "yes_price":    yes_price,
-                            "p_augur":      round(p_augur, 3),
-                            "edge":         round(edge, 3),
-                            "outcome":      outcome,
-                            "size_usdt":    size_usdt,
-                            "regime":       self._regime,
-                            "tps_mult":     tps_mult,
-                            "mode":         "live" if self._is_live else "paper",
-                            "timestamp_ms": int(time.time() * 1000),
-                        }
-                        if self._is_live:
-                            result = await self.mexc.place_prediction_bet(
-                                market_id, outcome, size_usdt
-                            )
-                            entry["result"] = result
-                            entry["event"]  = "prediction_bet_placed"
-
-                        _journal_append(_AUGUR_JOURNAL, entry)
-                        placed += 1
-                        if placed >= 5:
-                            break
-                    except Exception as e:
-                        logger.warning("prediction_item_error", error=str(e))
-
-                logger.info("mexc_prediction_scan_done",
-                            total_markets=len(markets), placed=placed)
-            except Exception as e:
-                logger.error("mexc_prediction_loop_error", error=str(e))
-            await asyncio.sleep(300)
 
     # ── Phase 6: Heartbeat ────────────────────────────────────────────────────
 
@@ -882,7 +796,6 @@ class AugurApplication:
         if self._is_live:
             await asyncio.gather(
                 self.bybit.health_check(),
-                self.mexc.health_check(),
                 return_exceptions=True,
             )
 
@@ -890,10 +803,9 @@ class AugurApplication:
             await asyncio.gather(
                 self.valuechain_loop(),
                 self.bybit_feed.start(),
-                self.bybit_cascade.start(),   # cross-venue cascade intelligence
+                self.bybit_cascade.start(),
                 self.augur_signal_loop(),
                 self.kingdom_sync_loop(),
-                self.mexc_prediction_loop(),
                 self.outcome_resolver.resolve_loop(),
                 self.cross_feedback.feedback_loop(),
                 self.heartbeat_loop(),
