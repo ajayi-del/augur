@@ -321,14 +321,17 @@ class BybitCascadeEngine:
             logger.warning("bybit_cascade_chancellor_error", error=str(e))
             return
 
-        # Publish lead signal to kingdom so ARIA knows we're ahead
-        self.kingdom.publish_augur_data(f"bybit_lead.{symbol}", {
+        # Update kingdom cascade key with independent lead signal so ARIA reads it
+        self.kingdom.publish_augur_data(f"bybit_cascade.{symbol}", {
             "symbol":        symbol,
-            "direction":     trade_direction,
-            "zscore":        zscore,
-            "score":         score,
+            "active":        True,
+            "direction":     direction,   # "bullish"/"bearish" — ARIA reads this key
+            "zscore":        round(zscore, 2),
+            "score":         round(score, 3),
+            "phase":         "expansion",
+            "independent_lead": True,
             "waiting_for_aria": True,
-            "expires_ms":    now_ms + 120_000,  # 2 min window
+            "expires_ms":    now_ms + 120_000,
             "timestamp_ms":  now_ms,
         })
 
