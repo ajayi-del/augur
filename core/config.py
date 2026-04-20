@@ -85,7 +85,7 @@ class Settings(BaseSettings):
         # Tier B: meme / high-vol
         "DOGE-PERP", "WIF-PERP", "BONK-PERP", "TRUMP-PERP",
         "PEPE-PERP", "CHILLGUY-PERP", "PIPPIN-PERP",
-        "PIEVERSE-PERP", "EDGE-PERP",
+        "PIEVERSE-PERP", "EDGE-PERP", "TRIA-PERP",
     ]
     news_assets: List[str] = [
         # Tier A
@@ -93,7 +93,7 @@ class Settings(BaseSettings):
         "NEAR", "APT", "INJ", "SEI", "TIA", "HBAR", "ATOM", "JUP", "WLD",
         # Tier B
         "DOGE", "WIF", "BONK", "TRUMP", "PEPE",
-        "CHILLGUY", "PIPPIN", "PIEVERSE", "EDGE",
+        "CHILLGUY", "PIPPIN", "PIEVERSE", "EDGE", "TRIA",
     ]
 
     class Config:

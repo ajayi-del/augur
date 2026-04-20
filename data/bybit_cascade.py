@@ -81,6 +81,7 @@ _SYMBOL_MAP: Dict[str, str] = {
     "SEI-USD":      "SEIUSDT",
     "MNT-USD":      "MNTUSDT",
     "TRUMP-USD":    "TRUMPUSDT",
+    "TRIA-USD":     "TRIAUSDT",
 }
 
 _REVERSE_MAP = {v: k for k, v in _SYMBOL_MAP.items()}
