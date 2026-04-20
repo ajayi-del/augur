@@ -192,8 +192,10 @@ class KingdomStateSync:
         """Returns non-expired ARIA bets for a specific symbol."""
         aria = self.read_aria_state()
         now_ms = int(time.time() * 1000)
+        bet_fields = AgentBet.__dataclass_fields__.keys()
         return [
-            AgentBet(**b) for b in aria.active_bets
+            AgentBet(**{k: v for k, v in b.items() if k in bet_fields})
+            for b in aria.active_bets
             if b.get("symbol") == symbol and b.get("expires_ms", 0) > now_ms
         ]
 
