@@ -2,6 +2,7 @@ import structlog
 import time
 import asyncio
 import aiohttp
+from datetime import datetime, timezone
 from typing import List, Optional
 from dataclasses import dataclass
 from polymarket.probability_engine import ProbabilityEngine, AugurProbability
@@ -14,8 +15,11 @@ _POLY_BASE = "https://clob.polymarket.com"
 _CRYPTO_KEYWORDS = {
     "BTC", "ETH", "SOL", "BNB", "AVAX", "CRYPTO", "BITCOIN",
     "ETHEREUM", "SOLANA", "FED", "RATE", "INFLATION", "DOGE",
-    "ARB", "OP", "PEPE", "DEFI", "NFT", "BLOCKCHAIN",
+    "ARB", "OP", "PEPE", "DEFI", "NFT", "BLOCKCHAIN", "COINBASE",
+    "BINANCE", "TRUMP", "TARIFF", "INTEREST RATE", "RECESSION",
 }
+
+_MIN_HOURS_TO_EXPIRY = 2.0   # skip markets expiring < 2h from now
 
 
 @dataclass
@@ -30,6 +34,36 @@ class BetOpportunity:
     expiry: int
 
 
+def _parse_yes_price(market: dict) -> Optional[float]:
+    """Extract YES token price from Polymarket market dict."""
+    tokens = market.get("tokens", [])
+    for tok in tokens:
+        if str(tok.get("outcome", "")).upper() == "YES":
+            try:
+                return float(tok["price"])
+            except (KeyError, ValueError, TypeError):
+                pass
+    # fallback: take first token price
+    if tokens:
+        try:
+            return float(tokens[0].get("price", 0.50))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _parse_expiry_ts(market: dict) -> Optional[int]:
+    """Parse end_date_iso → Unix timestamp (seconds)."""
+    raw = market.get("end_date_iso") or market.get("endDateIso", "")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 class MarketScanner:
     """
     Scans Polymarket public API for narrative arbitrage opportunities.
@@ -42,39 +76,67 @@ class MarketScanner:
         prob_engine: ProbabilityEngine,
         kelly_sizer: KellySizer,
         min_edge: float = 0.08,
-        min_liquidity: float = 5000.0,
+        min_liquidity: float = 5000.0,   # kept in signature but not used (no field in API)
     ):
         self.engine = prob_engine
         self.sizer = kelly_sizer
         self.min_edge = min_edge
-        self.min_liquidity = min_liquidity
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def get_public_markets(self) -> list:
-        """Fetches active markets from Polymarket public CLOB API. Never crashes."""
+        """
+        Fetches currently liquid markets from /sampling-markets (live order books).
+        Falls back to paginated /markets on error. Never crashes.
+        """
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                async with session.get(f"{_POLY_BASE}/sampling-markets") as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        markets = (
+                            data.get("data", data) if isinstance(data, dict) else data
+                        )
+                        if isinstance(markets, list):
+                            logger.info("polymarket_markets_fetched",
+                                        total_raw=len(markets), source="sampling-markets")
+                            return markets
+                    logger.warning("polymarket_sampling_non200", status=resp.status)
+        except Exception as e:
+            logger.warning("polymarket_sampling_error", error=str(e))
+
+        # Fallback: paginated /markets
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as session:
                 async with session.get(
                     f"{_POLY_BASE}/markets",
                     params={"active": "true", "limit": 100},
                 ) as resp:
-                    if resp.status != 200:
-                        logger.warning("polymarket_api_non200", status=resp.status)
-                        return []
-                    data = await resp.json(content_type=None)
-                    markets = data.get("data", []) if isinstance(data, dict) else data
-                    logger.info("polymarket_markets_fetched", count=len(markets))
-                    return markets
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        page = data.get("data", []) if isinstance(data, dict) else data
+                        markets = [
+                            m for m in page
+                            if not m.get("closed") and not m.get("archived")
+                        ]
+                        logger.info("polymarket_markets_fetched",
+                                    total_raw=len(markets), source="markets-fallback")
+                        return markets
         except Exception as e:
             logger.warning("polymarket_fetch_error", error=str(e))
-            return []
 
-    def _is_crypto_relevant(self, question: str) -> bool:
+        return []
+
+    def _is_crypto_relevant(self, question: str, tags: list) -> bool:
         q_upper = question.upper()
-        return any(kw in q_upper for kw in _CRYPTO_KEYWORDS)
+        if any(kw in q_upper for kw in _CRYPTO_KEYWORDS):
+            return True
+        tag_str = " ".join(str(t).upper() for t in (tags or []))
+        return any(kw in tag_str for kw in {"CRYPTO", "BITCOIN", "ETHEREUM"})
 
     # ── Scanner ───────────────────────────────────────────────────────────────
 
@@ -87,49 +149,47 @@ class MarketScanner:
         market_direction: str = "long",
     ) -> List[BetOpportunity]:
         """
-        Scans Polymarket public markets for edges.
-        Returns BetOpportunity list sorted by edge descending.
+        Scans Polymarket public markets for edges. Returns list sorted by edge.
         """
         funding_rates = funding_rates or {}
-        logger.info("scanning_polymarket", asset=asset)
+        now_ts = time.time()
+        logger.info("scanning_polymarket", asset=asset, direction=market_direction)
 
         raw_markets = await self.get_public_markets()
 
-        # Filter to crypto-relevant and liquid markets
-        relevant = [
-            m for m in raw_markets
-            if self._is_crypto_relevant(m.get("question", ""))
-            and float(m.get("liquidity", 0)) >= self.min_liquidity
-        ]
-        logger.info("polymarket_relevant_markets", count=len(relevant),
-                    min_liquidity=self.min_liquidity)
+        # Filter to crypto-relevant with valid price and sufficient time to expiry
+        relevant = []
+        for m in raw_markets:
+            q = m.get("question", "")
+            tags = m.get("tags", [])
+            if not self._is_crypto_relevant(q, tags):
+                continue
+            yes_price = _parse_yes_price(m)
+            if yes_price is None or yes_price <= 0 or yes_price >= 1:
+                continue
+            expiry_ts = _parse_expiry_ts(m)
+            if expiry_ts is None:
+                continue
+            hours_left = (expiry_ts - now_ts) / 3600.0
+            if hours_left < _MIN_HOURS_TO_EXPIRY:
+                continue
+            relevant.append((m, yes_price, expiry_ts))
+
+        logger.info("polymarket_relevant_markets", count=len(relevant))
 
         opportunities: List[BetOpportunity] = []
+        funding_rate_pct = funding_rates.get(asset)
 
-        for m in relevant:
+        for m, yes_price, expiry_ts in relevant:
             try:
-                market_id   = m.get("condition_id") or m.get("id", "unknown")
-                question    = m.get("question", "")
-                yes_price   = float(m.get("outcomePrices", ["0.5"])[0]
-                                    if isinstance(m.get("outcomePrices"), list)
-                                    else m.get("yes_price", m.get("outcomePrices", 0.50)))
-                liquidity   = float(m.get("liquidity", 0))
-                end_date_ts = int(m.get("endDateIso", 0) or 0)
-                if end_date_ts == 0:
-                    # try other field names
-                    end_date_ts = int(m.get("end_date_iso", m.get("expiry", 0)) or 0)
-                if end_date_ts == 0:
-                    continue  # no expiry — skip
-
-                # Pick funding rate for this asset if available
-                funding_rate_pct = funding_rates.get(asset)
+                market_id = m.get("condition_id") or m.get("id", "unknown")
+                question  = m.get("question", "")
 
                 prob_res = self.engine.compute_augur_probability(
                     market_id=market_id,
                     target_asset=asset,
-                    expiry_timestamp=end_date_ts,
+                    expiry_timestamp=expiry_ts,
                     yes_price=yes_price,
-                    liquidity_usdc=liquidity,
                     cascade_alert=cascade_alert,
                     aria_coherence=aria_coherence,
                     funding_rate_pct=funding_rate_pct,
@@ -167,7 +227,7 @@ class MarketScanner:
                             edge=edge,
                             bet_size_usd=size,
                             side=side,
-                            expiry=end_date_ts,
+                            expiry=expiry_ts,
                         )
                         opportunities.append(opp)
                         logger.info("opportunity_found",

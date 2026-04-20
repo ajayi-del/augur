@@ -175,8 +175,8 @@ class AugurApplication:
 
                 # Publish current AUGUR state to kingdom
                 augur_state = AugurState(
-                    active_bets=self.journal.get_active_bets(),
-                    active_polymarket_bets=self.journal.get_active_polymarket_bets(),
+                    active_bets=[],
+                    active_polymarket_bets=[],
                     etf_flow_direction=self._regime,
                 )
                 self.kingdom.write_augur_state(augur_state)
