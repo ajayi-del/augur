@@ -73,18 +73,27 @@ class Settings(BaseSettings):
     max_open_trades: int    = 4   # AUGUR global position cap
 
     # Tracked markets — alts + meme coins, no stocks
+    # Tier A: high liquidity, broad coverage (Bybit + MEXC both list these)
+    # Tier B: strong narrative / meme coins with good Bybit depth
     watched_markets: List[str] = [
-        "SOL-PERP", "DOGE-PERP", "WIF-PERP", "BONK-PERP",
-        "TRUMP-PERP", "PEPE-PERP", "SUI-PERP", "ARB-PERP",
-        "OP-PERP", "MNT-PERP", "EDGE-PERP",
-        "CHILLGUY-PERP", "PIPPIN-PERP", "PIEVERSE-PERP",
-        "AVAX-PERP", "BNB-PERP", "HYPE-PERP", "ENA-PERP",
+        # Tier A: liquid alts
+        "SOL-PERP", "AVAX-PERP", "BNB-PERP", "SUI-PERP",
+        "ARB-PERP", "OP-PERP", "MNT-PERP", "HYPE-PERP", "ENA-PERP",
+        "NEAR-PERP", "APT-PERP", "INJ-PERP", "SEI-PERP",
+        "TIA-PERP", "HBAR-PERP", "ATOM-PERP",
+        "JUP-PERP", "WLD-PERP",
+        # Tier B: meme / high-vol
+        "DOGE-PERP", "WIF-PERP", "BONK-PERP", "TRUMP-PERP",
+        "PEPE-PERP", "CHILLGUY-PERP", "PIPPIN-PERP",
+        "PIEVERSE-PERP", "EDGE-PERP",
     ]
     news_assets: List[str] = [
-        "SOL", "DOGE", "WIF", "BONK", "TRUMP", "PEPE",
-        "SUI", "ARB", "OP", "MNT", "EDGE",
-        "CHILLGUY", "PIPPIN", "PIEVERSE",
-        "AVAX", "BNB", "HYPE", "ENA",
+        # Tier A
+        "SOL", "AVAX", "BNB", "SUI", "ARB", "OP", "MNT", "HYPE", "ENA",
+        "NEAR", "APT", "INJ", "SEI", "TIA", "HBAR", "ATOM", "JUP", "WLD",
+        # Tier B
+        "DOGE", "WIF", "BONK", "TRUMP", "PEPE",
+        "CHILLGUY", "PIPPIN", "PIEVERSE", "EDGE",
     ]
 
     class Config:

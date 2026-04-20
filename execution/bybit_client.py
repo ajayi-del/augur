@@ -36,6 +36,18 @@ _SYMBOL_MAP: dict[str, str] = {
     "SUI-USD":       "SUIUSDT",
     "MNT-USD":       "MNTUSDT",
     "EDGE-USD":      "EDGEUSDT",
+    # Liquid alts
+    "NEAR-USD":      "NEARUSDT",
+    "APT-USD":       "APTUSDT",
+    "SEI-USD":       "SEIUSDT",
+    "INJ-USD":       "INJUSDT",
+    "TIA-USD":       "TIAUSDT",
+    "JUP-USD":       "JUPUSDT",
+    "WLD-USD":       "WLDUSDT",
+    "HBAR-USD":      "HBARUSDT",
+    "ATOM-USD":      "ATOMUSDT",
+    "HYPE-USD":      "HYPEUSDT",
+    "ENA-USD":       "ENAUSDT",
     # Meme / culture coins
     "BONK-USD":      "BONKUSDT",
     "WIF-USD":       "WIFUSDT",

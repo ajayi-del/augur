@@ -9,10 +9,14 @@ from typing import Dict
 from core.config import config as settings
 from data.valuechain_bridge import ValueChainBridge
 from data.solana_bridge import SolanaBridge
+from data.bybit_feed import BybitFeed
 from kingdom.state_sync import KingdomStateSync, AugurState, AgentBet
 from intelligence.prediction_market import CrossAgentBetEngine
 from intelligence.prediction_market import AgentBet as PredictionBet
 from memory.trade_journal import TradeJournal
+from memory.augur_hist_wr import augur_hist_wr
+from memory.outcome_resolver import OutcomeResolver
+from memory.cross_agent_feedback import CrossAgentFeedback
 from execution.venues.mexc_client import MexcClient
 from execution.bybit_client import BybitClient
 from execution.routing_client import RoutingClient
@@ -71,6 +75,9 @@ class AugurApplication:
         # Solana on-chain signals (CoinGecko prices, TPS)
         self.solana = SolanaBridge()
 
+        # Bybit real-time market data (mark prices, OB imbalance, liquidations)
+        self.bybit_feed = BybitFeed(symbols=cfg.news_assets)
+
         # Execution layer
         self.mexc = MexcClient(
             api_key=cfg.mexc_api_key,
@@ -97,6 +104,10 @@ class AugurApplication:
         # Journal
         self.journal = TradeJournal()
         self.journal.load()
+
+        # Learning loop components
+        self.outcome_resolver  = OutcomeResolver(bybit_client=self.bybit)
+        self.cross_feedback    = CrossAgentFeedback(kingdom=self.kingdom)
 
         # Cached ValueChain state — refreshed every 600s
         self._cascade_alert: dict  = {"active": False, "zscore": 0.0, "phase": "none"}
@@ -209,111 +220,117 @@ class AugurApplication:
     async def augur_signal_loop(self) -> None:
         """
         Every 30s — AUGUR's independent on-chain signal evaluation.
-        Reads CoinGecko price momentum, Solana TPS, and Drift funding rates.
-        Generates AUGUR-native PredictionBets (evidence_type='microstructure')
-        into CrossAgentBetEngine. When ARIA and AUGUR independently agree,
-        market_confidence crosses 0.7 and live execution gates open.
+
+        Signal stack (Solana-native + Bybit market data):
+          1. Solana TPS trend       (weight 0.20) — network health/congestion
+          2. Bybit mark price momentum (weight 0.45) — venue-native price action
+          3. Bybit order book imbalance (weight 0.20) — real-time buy/sell pressure
+          4. Drift/Bybit funding rate   (weight 0.15) — carry signal
+
+        AUGUR generates microstructure PredictionBets. When ARIA (narrative) and
+        AUGUR (microstructure) agree, EVIDENCE_INDEPENDENCE=1.0 gives max bonus.
+        Confidence is calibrated by hist_wr — after 10+ trades the priors update.
         """
         logger.info("augur_signal_loop_started", interval_s=30)
-        _prev_tps: float = 0.0
 
         while True:
             try:
-                tps    = await self.solana.get_network_tps()
-                prices = await self.solana.get_jupiter_prices()   # CoinGecko under the hood
+                tps   = await self.solana.get_network_tps()
                 now_ms = int(time.time() * 1000)
 
                 for symbol in self.config.news_assets:
+                    aria_sym = f"{symbol}-USD"
                     try:
-                        # ── Signal 1: TPS trend (Solana health) ──────────────
-                        if tps >= 3000:
-                            tps_signal = 0.60    # network active → bullish
-                        elif tps >= 1500:
-                            tps_signal = 0.53
-                        elif tps > 0 and tps < 800:
-                            tps_signal = 0.40    # congestion → bearish
-                        else:
-                            tps_signal = 0.50    # unknown or mid → neutral
+                        # ── Signal 1: Solana TPS ──────────────────────────────
+                        if tps >= 3000:    tps_signal = 0.58
+                        elif tps >= 1500:  tps_signal = 0.53
+                        elif tps > 0 and tps < 800: tps_signal = 0.42
+                        else:              tps_signal = 0.50
 
-                        # ── Signal 2: CoinGecko price momentum ───────────────
-                        price_now = prices.get(symbol, 0.0)
-                        price_signal = 0.50
-                        if price_now > 0 and symbol in self._price_prev:
-                            prev = self._price_prev.get(symbol, 0.0)
-                            if prev > 0:
-                                pct = (price_now - prev) / prev * 100.0
-                                if pct > 0.5:
-                                    price_signal = 0.70
-                                elif pct > 0.2:
-                                    price_signal = 0.60
-                                elif pct < -0.5:
-                                    price_signal = 0.30
-                                elif pct < -0.2:
-                                    price_signal = 0.40
+                        # ── Signal 2: Bybit mark price momentum ───────────────
+                        pct_30s = self.bybit_feed.get_price_momentum(aria_sym, 30.0)
+                        if pct_30s > 0.5:   price_signal = 0.72
+                        elif pct_30s > 0.2: price_signal = 0.62
+                        elif pct_30s > 0.0: price_signal = 0.53
+                        elif pct_30s < -0.5: price_signal = 0.28
+                        elif pct_30s < -0.2: price_signal = 0.38
+                        elif pct_30s < 0.0:  price_signal = 0.47
+                        else:                price_signal = 0.50   # no data yet
 
-                        # ── Signal 3: Drift funding rate ──────────────────────
-                        fund_rate = self._funding_rates.get(symbol, 0.0)
-                        if fund_rate > 0.02:    # longs paying heavily → bearish
-                            fund_signal = 0.38
-                        elif fund_rate > 0.005:
-                            fund_signal = 0.45
-                        elif fund_rate < -0.02: # shorts paying → bullish
-                            fund_signal = 0.62
-                        elif fund_rate < -0.005:
-                            fund_signal = 0.55
-                        else:
-                            fund_signal = 0.50
+                        # ── Signal 3: Bybit orderbook imbalance ───────────────
+                        agg = self.bybit_feed.get_agg_ratio(aria_sym)
+                        if agg > 0.65:   ob_signal = 0.68
+                        elif agg > 0.55: ob_signal = 0.58
+                        elif agg < 0.35: ob_signal = 0.32
+                        elif agg < 0.45: ob_signal = 0.42
+                        else:            ob_signal = 0.50
+
+                        # ── Signal 4: Funding rate (Bybit > Drift fallback) ───
+                        fund_rate = (
+                            self.bybit_feed.get_funding_rate(aria_sym) or
+                            self._funding_rates.get(symbol, 0.0)
+                        )
+                        if fund_rate > 0.02:    fund_signal = 0.38
+                        elif fund_rate > 0.005: fund_signal = 0.45
+                        elif fund_rate < -0.02: fund_signal = 0.62
+                        elif fund_rate < -0.005: fund_signal = 0.55
+                        else:                   fund_signal = 0.50
 
                         combined = (
-                            _TPS_WEIGHT     * tps_signal +
-                            _PRICE_WEIGHT   * price_signal +
-                            _FUNDING_WEIGHT * fund_signal
+                            0.20 * tps_signal +
+                            0.45 * price_signal +
+                            0.20 * ob_signal +
+                            0.15 * fund_signal
                         )
 
-                        # Ignore near-neutral noise
                         deviation = abs(combined - 0.50)
                         if deviation < 0.04:
                             continue
 
                         direction  = "long" if combined > 0.50 else "short"
-                        confidence = min(deviation * 2.5, 0.85)
+                        raw_conf   = min(deviation * 2.5, 0.85)
 
-                        if confidence < _MIN_BET_CONFIDENCE:
+                        if raw_conf < _MIN_BET_CONFIDENCE:
                             continue
 
-                        # TPS as proxy for Solana coherence (TPS/600 → coherence 0–10)
-                        coherence = min(tps / 600.0, 10.0) if tps > 0 else 3.0
+                        # Calibrate confidence with historical win rate
+                        wr_mult    = augur_hist_wr.confidence_multiplier(symbol, direction)
+                        confidence = round(min(raw_conf * wr_mult, 0.90), 3)
+
+                        # Alignment score from cross-agent feedback (replaces 0.5 default)
+                        alignment  = self.cross_feedback.get_alignment(aria_sym)
+
+                        # Coherence: TPS/600 (Solana), boosted by alignment
+                        coherence  = round(
+                            min((tps / 600.0 if tps > 0 else 3.0) * (0.5 + alignment), 10.0), 2
+                        )
 
                         augur_bet = PredictionBet(
                             agent_id="augur",
-                            symbol=f"{symbol}-USD",
+                            symbol=aria_sym,
                             direction=direction,
-                            confidence=round(confidence, 3),
+                            confidence=confidence,
                             evidence_type="microstructure",
-                            coherence=round(coherence, 2),
+                            coherence=coherence,
                             timestamp_ms=now_ms,
                             expires_ms=now_ms + 30 * 60 * 1000,
                         )
                         self.bet_engine.place_bet(augur_bet)
                         logger.debug(
                             "augur_native_bet",
-                            symbol=f"{symbol}-USD",
+                            symbol=aria_sym,
                             direction=direction,
-                            confidence=round(confidence, 3),
-                            tps_signal=round(tps_signal, 2),
-                            price_signal=round(price_signal, 2),
-                            fund_signal=round(fund_signal, 2),
+                            confidence=confidence,
+                            raw_conf=round(raw_conf, 3),
+                            wr_mult=wr_mult,
+                            alignment=round(alignment, 3),
+                            agg_ratio=round(agg, 3),
+                            price_pct=round(pct_30s, 3),
                         )
 
                     except Exception as e:
-                        logger.warning("augur_signal_symbol_error", symbol=symbol, error=str(e))
-
-                # Update price snapshot for next-cycle momentum
-                self._price_prev = {
-                    sym: prices.get(sym, self._price_prev.get(sym, 0.0))
-                    for sym in self.config.news_assets
-                }
-                _prev_tps = tps
+                        logger.warning("augur_signal_symbol_error",
+                                       symbol=symbol, error=str(e))
 
             except Exception as e:
                 logger.error("augur_signal_loop_error", error=str(e))
@@ -437,6 +454,14 @@ class AugurApplication:
                             self.kingdom.write_position(
                                 "augur", aria_bet.symbol, aria_bet.direction,
                                 size_usd, order.venue,
+                            )
+                            # Register with outcome resolver for learning loop
+                            self.outcome_resolver.register_position(
+                                symbol=aria_bet.symbol,
+                                direction=aria_bet.direction,
+                                size_usd=size_usd,
+                                entry_price=order.entry,
+                                venue=order.venue,
                             )
 
                             _journal_append(_AUGUR_JOURNAL, {
@@ -620,9 +645,12 @@ class AugurApplication:
         try:
             await asyncio.gather(
                 self.valuechain_loop(),
+                self.bybit_feed.start(),
                 self.augur_signal_loop(),
                 self.kingdom_sync_loop(),
                 self.mexc_prediction_loop(),
+                self.outcome_resolver.resolve_loop(),
+                self.cross_feedback.feedback_loop(),
                 self.heartbeat_loop(),
             )
         finally:
