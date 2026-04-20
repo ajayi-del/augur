@@ -19,8 +19,8 @@ from typing import Dict, Optional
 logger = structlog.get_logger(__name__)
 
 _SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
-_JUPITER_V4     = "https://price.jup.ag/v4/price"
-_JUPITER_V6     = "https://api.jup.ag/price/v2"   # fallback if v4 deprecated
+_JUPITER_V6     = "https://api.jup.ag/price/v2"    # primary (v4 domain unreliable)
+_JUPITER_V4     = "https://price.jup.ag/v4/price"  # fallback
 _JUP_IDS        = "SOL,BTC,ETH,BONK"
 
 _TPS_CACHE_TTL   = 60    # seconds
@@ -89,10 +89,13 @@ class SolanaBridge:
 
         prices: Dict[str, float] = {}
 
-        # Try Jupiter v4
+        # Try Jupiter v6 (primary — api.jup.ag resolves better on GCP)
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-                async with s.get(_JUPITER_V4, params={"ids": _JUP_IDS}) as r:
+                async with s.get(
+                    _JUPITER_V6,
+                    params={"ids": _JUP_IDS, "showExtraInfo": "false"},
+                ) as r:
                     if r.status == 200:
                         data = await r.json(content_type=None)
                         for sym, info in (data.get("data") or {}).items():
@@ -100,16 +103,13 @@ class SolanaBridge:
                             if p > 0:
                                 prices[sym] = p
         except Exception as e:
-            logger.warning("jupiter_v4_error", error=str(e))
+            logger.warning("jupiter_v6_error", error=str(e))
 
-        # Fallback to v6 if v4 returned nothing
+        # Fallback to v4 if v6 returned nothing
         if not prices:
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-                    async with s.get(
-                        _JUPITER_V6,
-                        params={"ids": _JUP_IDS, "showExtraInfo": "false"},
-                    ) as r:
+                    async with s.get(_JUPITER_V4, params={"ids": _JUP_IDS}) as r:
                         if r.status == 200:
                             data = await r.json(content_type=None)
                             for sym, info in (data.get("data") or {}).items():
@@ -117,7 +117,7 @@ class SolanaBridge:
                                 if p > 0:
                                     prices[sym] = p
             except Exception as e:
-                logger.warning("jupiter_v6_error", error=str(e))
+                logger.warning("jupiter_v4_error", error=str(e))
 
         if prices:
             self._price_cache    = prices

@@ -11,6 +11,7 @@ from data.valuechain_bridge import ValueChainBridge
 from data.solana_bridge import SolanaBridge
 from kingdom.state_sync import KingdomStateSync, AugurState, AgentBet
 from intelligence.prediction_market import CrossAgentBetEngine
+from intelligence.prediction_market import AgentBet as PredictionBet
 from memory.trade_journal import TradeJournal
 from execution.venues.mexc_client import MexcClient
 from execution.bybit_client import BybitClient
@@ -213,13 +214,16 @@ class AugurApplication:
 
                     for bet_dict in aria.active_bets:
                         try:
+                            # Build kingdom dataclass (for field access)
                             aria_bet = AgentBet(**{
                                 k: v for k, v in bet_dict.items()
                                 if k in AgentBet.__dataclass_fields__
                             })
+                            # Build pydantic model (required by CrossAgentBetEngine)
+                            pm_bet = PredictionBet.model_validate(bet_dict)
 
-                            self.bet_engine.place_bet(aria_bet)
-                            resolution = self.bet_engine.resolve(aria_bet.symbol)
+                            self.bet_engine.place_bet(pm_bet)
+                            resolution = self.bet_engine.resolve(pm_bet.symbol)
 
                             log_entry = {
                                 "event":              "cross_bet_resolution",
