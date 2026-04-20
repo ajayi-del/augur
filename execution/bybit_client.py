@@ -170,7 +170,21 @@ class BybitClient:
 
         bybit_sym = self._to_bybit_symbol(symbol)
         side      = "Buy" if direction == "long" else "Sell"
-        qty       = round(size_usd / entry, 6) if entry > 0 else 0.001
+
+        if entry > 0:
+            raw_qty = size_usd / entry
+            # Bybit qty precision varies by price tier (step size from instrument info)
+            # Heuristic: integer for sub-$1 and sub-$10 assets; decimals for majors
+            if entry < 1:
+                qty = int(raw_qty)          # OP, PEPE etc — integer contracts
+            elif entry < 10:
+                qty = round(raw_qty, 1)
+            elif entry < 100:
+                qty = round(raw_qty, 2)
+            else:
+                qty = round(raw_qty, 3)
+        else:
+            qty = 1
 
         await self._set_leverage(bybit_sym, leverage)
 
