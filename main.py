@@ -386,8 +386,22 @@ class AugurApplication:
                         wr_mult    = augur_hist_wr.confidence_multiplier(symbol, direction)
                         confidence = round(min(raw_conf * wr_mult, 0.90), 3)
 
-                        # Alignment score from cross-agent feedback
+                        # Alignment from cross-feedback. When no history exists
+                        # (neutral ≤ 0.52), proxy from ARIA's coherence — a strong
+                        # ARIA signal is implicit agreement until AUGUR earns its own record.
                         alignment = self.cross_feedback.get_alignment(aria_sym)
+                        if alignment <= 0.52:
+                            aria_bet_dict = next(
+                                (b for b in aria_state.active_bets
+                                 if b.get("symbol") == aria_sym),
+                                None,
+                            )
+                            aria_coh = (aria_bet_dict.get("coherence", 0.0)
+                                        if aria_bet_dict else 0.0)
+                            if aria_coh > 7.0:
+                                alignment = 0.65
+                            elif aria_coh > 5.0:
+                                alignment = 0.55
                         coherence = round(
                             min((tps / 600.0 if tps > 0 else 3.0) * (0.5 + alignment), 10.0), 2
                         )
@@ -580,20 +594,35 @@ class AugurApplication:
                         if aria_bet.direction == "neutral":
                             continue
 
-                        # Conviction check
-                        if resolution.market_confidence < _CONFIDENCE_LOG_FLOOR:
-                            logger.info("position_deferred_low_conviction",
-                                        symbol=aria_bet.symbol,
-                                        confidence=round(resolution.market_confidence, 3),
-                                        agreement=resolution.agreement_type)
+                        # Conviction gate — threshold scales with agreement strength.
+                        # single_aria: ARIA carries the signal, 0.35 is enough.
+                        # compound:    both agents must be convinced, 0.55 required.
+                        # single_augur/silence/disagreement: deferred.
+                        atype = resolution.agreement_type
+                        if atype in ("silence", "disagreement"):
                             continue
-                        if resolution.market_confidence < _CONFIDENCE_GATE:
-                            continue
-                        if resolution.agreement_type in _SINGLE_AGENT_TYPES:
-                            logger.info("position_deferred_single_agent",
-                                        symbol=aria_bet.symbol,
-                                        agreement=resolution.agreement_type)
-                            continue
+                        if atype == "single_augur":
+                            # AUGUR alone must be highly convinced
+                            if resolution.market_confidence < 0.55:
+                                logger.info("position_deferred_low_conviction",
+                                            symbol=aria_bet.symbol,
+                                            confidence=round(resolution.market_confidence, 3),
+                                            agreement=atype)
+                                continue
+                        elif atype in ("weak_agreement", "strong_agreement"):
+                            if resolution.market_confidence < 0.55:
+                                logger.info("position_deferred_low_conviction",
+                                            symbol=aria_bet.symbol,
+                                            confidence=round(resolution.market_confidence, 3),
+                                            agreement=atype)
+                                continue
+                        else:  # single_aria — ARIA carries the weight
+                            if resolution.market_confidence < 0.35:
+                                logger.info("position_deferred_low_conviction",
+                                            symbol=aria_bet.symbol,
+                                            confidence=round(resolution.market_confidence, 3),
+                                            agreement=atype)
+                                continue
                         if aria_bet.coherence < self.config.min_coherence:
                             continue
                         if self._is_signal_on_cooldown(aria_bet.symbol,
