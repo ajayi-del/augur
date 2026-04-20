@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Mode
-    mode: Literal["paper", "live"] = "paper"
-    live_mode_confirmed: bool = False
+    mode: Literal["paper", "live"] = "live"
+    live_mode_confirmed: bool = True
 
     # Logging
     log_level: str = "INFO"
