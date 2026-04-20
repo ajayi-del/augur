@@ -49,7 +49,15 @@ class RoutingClient:
         1. Try MEXC futures.
         2. On any failure, fall back to Bybit linear.
         Returns OrderResult regardless of which venue filled.
+
+        If entry=0, fetches live price from MEXC public ticker before routing.
+        This ensures Bybit fallback always has a valid price for qty computation.
         """
+        if entry <= 0:
+            entry = await self.mexc.get_ticker_price(symbol)
+            if entry > 0:
+                logger.debug("routing_price_fetched", symbol=symbol, price=entry)
+
         try:
             result = await self.mexc.place_futures_order(
                 symbol=symbol,

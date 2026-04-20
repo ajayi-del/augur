@@ -140,7 +140,16 @@ class MexcClient:
             async with s.post(
                 f"{_FUTURES_BASE}{path}", data=body_str, headers=headers
             ) as r:
-                return await r.json(content_type=None)
+                text = await r.text()
+                if not text.strip():
+                    raise RuntimeError(
+                        f"MEXC returned empty body — check API key has futures "
+                        f"trading permission (HTTP {r.status})"
+                    )
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"MEXC non-JSON response: {text[:200]}")
 
     # ── Market data (public) ──────────────────────────────────────────────────
 
