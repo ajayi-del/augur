@@ -137,7 +137,8 @@ class BybitClient:
             )
             for c in coins:
                 if c.get("coin") == "USDT":
-                    return float(c.get("availableToWithdraw", 0.0))
+                    raw = c.get("availableToWithdraw") or "0"
+                    return float(raw)
         except Exception as e:
             logger.warning("bybit_balance_error", error=str(e))
         return 0.0

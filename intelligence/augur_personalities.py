@@ -158,7 +158,7 @@ def assign_personality(
         return AugurPersonality.SCOUT
 
     # 7. Default: MOMENTUM
-    logger.debug("augur_personality_assigned",
-                 personality="momentum", reason="default_directional",
-                 symbol=signal.symbol, size_mult=1.0)
+    logger.info("augur_personality_assigned",
+                personality="momentum", reason="default_directional",
+                symbol=signal.symbol, size_mult=1.0)
     return AugurPersonality.MOMENTUM

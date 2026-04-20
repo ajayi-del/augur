@@ -154,7 +154,7 @@ class AugurApplication:
         self._regime:            str         = "unknown"
         self._funding_rates:     dict        = {}
         self._solana_snapshot:   dict        = {}
-        self._cached_balance:    float       = 0.0   # updated by heartbeat_loop
+        self._cached_balance:    float       = 300.0  # sentinel until first fetch
         self._daily_loss_pct:    float       = 0.0   # updated from kingdom drawdown
 
         # Cross-venue cascade engine — Bybit leads SoDEX by 200–800ms
@@ -435,7 +435,7 @@ class AugurApplication:
                         )
 
                         if not kant_frame.passed:
-                            logger.debug(
+                            logger.info(
                                 "augur_kant_blocked",
                                 symbol=aria_sym,
                                 personality=personality.value,
@@ -454,7 +454,7 @@ class AugurApplication:
                             )
 
                             if will_out.will_state == WillState.ABSTAIN:
-                                logger.debug(
+                                logger.info(
                                     "augur_nietzsche_abstain",
                                     symbol=aria_sym,
                                     conviction=will_out.conviction,
@@ -477,7 +477,7 @@ class AugurApplication:
                             expires_ms=now_ms + 30 * 60 * 1000,
                         )
                         self.bet_engine.place_bet(augur_bet)
-                        logger.debug(
+                        logger.info(
                             "augur_native_bet",
                             symbol=aria_sym,
                             direction=direction,
@@ -485,8 +485,9 @@ class AugurApplication:
                             personality=personality.value,
                             will=(will_out.will_state.value
                                   if kant_frame.passed else "kant_blocked"),
-                            alignment=round(alignment, 3),
+                            combined=round(combined, 3),
                             agg_ratio=round(agg, 3),
+                            price_momentum=round(pct_30s, 3),
                         )
 
                     except Exception as e:
@@ -801,7 +802,8 @@ class AugurApplication:
                 if self._is_live:
                     try:
                         bal = await self.bybit.get_balance()
-                        self._cached_balance = bal
+                        if bal > 0:
+                            self._cached_balance = bal
                         balance_str = f"  bybit_usdt={bal:.2f}"
                         if bal < 20.0:
                             logger.warning("bybit_low_balance", usdt=bal)
