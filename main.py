@@ -54,6 +54,7 @@ from memory.cross_agent_feedback import CrossAgentFeedback
 from memory.cross_learning import CrossLearningEngine
 from execution.bybit_client import BybitClient
 from execution.routing_client import RoutingClient
+from intelligence.strategy_runner import StrategyRunner
 
 logger = structlog.get_logger()
 
@@ -152,6 +153,16 @@ class AugurApplication:
             chancellor=self.chancellor,
             router=self.router,
             base_trade_usd=cfg.base_trade_usd,
+        )
+
+        # Strategy runner — PERP_CASCADE + PERP_MOMENTUM, 30s cycle
+        self.strategy_runner = StrategyRunner(
+            bybit_feed      = self.bybit_feed,
+            kingdom         = self.kingdom,
+            chancellor      = self.chancellor,
+            router          = self.router,
+            get_balance     = lambda: self._cached_balance,
+            get_daily_loss  = lambda: self._daily_loss_pct,
         )
 
         # Execution dedup — {symbol: last_executed_ms}
@@ -809,6 +820,7 @@ class AugurApplication:
                 self.outcome_resolver.resolve_loop(),
                 self.cross_feedback.feedback_loop(),
                 self.heartbeat_loop(),
+                self.strategy_runner.run_forever(),
             )
         finally:
             if self._kingdom_observer:
