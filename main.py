@@ -22,8 +22,10 @@ logger = structlog.get_logger()
 _POLY_JOURNAL  = Path(settings.augur_log_path) / "polymarket_journal.jsonl"
 _AUGUR_JOURNAL = Path(settings.augur_log_path) / "augur_journal.jsonl"
 
-# Minimum cross-agent resolution score to trigger live execution
-_EXECUTION_SCORE_FLOOR  = 5.0
+# Minimum cross-agent resolution score to trigger live execution.
+# single_aria max score = confidence × 5.0 (~2.5 for typical ARIA bets)
+# strong_agreement: 7.0+ | weak_agreement: 5.0+ | single_aria: 1.5+
+_EXECUTION_SCORE_FLOOR  = 1.5
 # Per-symbol cooldown — prevents re-entering the same signal every 60s
 _EXECUTION_COOLDOWN_MS  = 30 * 60 * 1000   # 30 minutes
 
