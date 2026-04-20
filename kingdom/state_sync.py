@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -5,7 +6,14 @@ import structlog
 from pathlib import Path
 from filelock import FileLock
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
 
 logger = structlog.get_logger()
 
@@ -59,11 +67,39 @@ class KingdomState:
     version: str = "2.0"
 
 
+class _KingdomFileWatcher:
+    """
+    Watchdog event handler for kingdom_state.json.
+    Notifies asyncio when ARIA writes a new signal — sub-100ms latency.
+    Falls back to polling (120s) if watchdog is unavailable.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, callback: Callable) -> None:
+        self._loop     = loop
+        self._callback = callback
+        self._last_ms  = 0.0
+        self._debounce = 0.050  # 50ms debounce — prevent duplicate fires on atomic writes
+
+    def on_modified(self, event) -> None:
+        if not str(event.src_path).endswith("kingdom_state.json"):
+            return
+        now = time.time()
+        if now - self._last_ms < self._debounce:
+            return
+        self._last_ms = now
+        self._loop.call_soon_threadsafe(self._callback)
+
+
+if _WATCHDOG_AVAILABLE:
+    class _WatchdogHandler(_KingdomFileWatcher, FileSystemEventHandler):
+        pass
+
+
 class KingdomStateSync:
     """
     KINGDOM SYNC — The Sovereign Wire
     Coordinates intelligence between ARIA and AUGUR via kingdom_state.json.
-    v2.1: Atomic, thread-safe, with default path from env/config.
+    v2.2: Atomic, thread-safe, watchdog event-driven (sub-100ms latency).
     """
 
     def __init__(self, state_path: Optional[str] = None):
@@ -72,6 +108,40 @@ class KingdomStateSync:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.state_path.with_suffix(".lock")
         self.lock = FileLock(str(self.lock_path), timeout=5)
+
+    # ── Watchdog ─────────────────────────────────────────────────────────────
+
+    def start_watcher(
+        self,
+        callback: Callable,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Optional[object]:
+        """
+        Start a filesystem watcher on kingdom_state.json.
+        When ARIA writes, callback fires on the event loop within ~50ms.
+
+        Returns the Observer so the caller can stop it on shutdown.
+        Returns None if watchdog is not installed (falls back to polling).
+        """
+        if not _WATCHDOG_AVAILABLE:
+            logger.warning(
+                "kingdom_watcher_unavailable",
+                reason="watchdog not installed — falling back to 120s polling",
+                install="pip install watchdog",
+            )
+            return None
+
+        handler  = _WatchdogHandler(loop=loop, callback=callback)
+        observer = Observer()
+        observer.schedule(handler, path=str(self.state_path.parent), recursive=False)
+        observer.start()
+        logger.info(
+            "kingdom_watcher_started",
+            path=str(self.state_path),
+            debounce_ms=50,
+            latency_target_ms=100,
+        )
+        return observer
 
     # ── Read ────────────────────────────────────────────────────────────────
 
@@ -215,6 +285,79 @@ class KingdomStateSync:
                             symbol=bet.symbol, direction=bet.direction)
         except Exception as e:
             logger.error("publish_augur_bet_error", error=str(e))
+
+    # ── Augur data bus ──────────────────────────────────────────────────────
+
+    def publish_augur_data(self, key: str, data: dict) -> None:
+        """
+        Write arbitrary AUGUR intelligence to kingdom state.
+        ARIA reads this to confirm or deny its own signals.
+
+        Stored under kingdom["augur_data"][key].
+        Both agents can read; only AUGUR writes.
+        """
+        try:
+            with self.lock:
+                current: Dict = {}
+                if self.state_path.exists() and self.state_path.stat().st_size > 0:
+                    try:
+                        with open(self.state_path, "r") as f:
+                            current = json.load(f)
+                    except json.JSONDecodeError:
+                        current = {}
+
+                augur_data = current.get("augur_data", {})
+                augur_data[key] = data
+                current["augur_data"] = augur_data
+                current["version"]    = "2.0"
+
+                tmp = self.state_path.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(current, f, indent=2)
+                tmp.replace(self.state_path)
+                logger.debug("augur_data_published", key=key)
+        except Exception as e:
+            logger.error("publish_augur_data_error", key=key, error=str(e))
+
+    def get_augur_data(self, key: str, default=None) -> Optional[Dict]:
+        """Read AUGUR intelligence by key. Used by both agents."""
+        try:
+            with self.lock:
+                if not self.state_path.exists():
+                    return default
+                with open(self.state_path, "r") as f:
+                    data = json.load(f)
+                return data.get("augur_data", {}).get(key, default)
+        except Exception:
+            return default
+
+    def get_aria_cascade(self, symbol: str) -> Optional[Dict]:
+        """
+        Read ARIA's live cascade alert for a symbol.
+        Used by BybitCascadeEngine to detect if ARIA already sees the cascade.
+        """
+        try:
+            state = self.read()
+            alert = state.aria.cascade_alert
+            if not alert.get("active"):
+                return None
+            # ARIA cascade_alert is global (not per-symbol currently)
+            # Return with direction inferred from the alert phase
+            phase = alert.get("phase", "none")
+            direction = (
+                "bearish" if "sell" in phase.lower() else
+                "bullish" if "buy" in phase.lower() else
+                None
+            )
+            return {
+                "active":    alert.get("active", False),
+                "zscore":    alert.get("zscore", 0.0),
+                "phase":     phase,
+                "direction": direction,
+                "symbol":    symbol,
+            }
+        except Exception:
+            return None
 
     # ── Internal ────────────────────────────────────────────────────────────
 
