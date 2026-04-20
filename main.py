@@ -111,7 +111,8 @@ class AugurApplication:
         self.solana = SolanaBridge()
 
         # Bybit real-time market data (mark prices, OB imbalance, liquidations)
-        self.bybit_feed = BybitFeed(symbols=cfg.news_assets)
+        # news_assets are bare symbols ("SOL") — feed expects "SOL-USD" format
+        self.bybit_feed = BybitFeed(symbols=[f"{s}-USD" for s in cfg.news_assets])
 
         # Execution layer — Bybit primary (MEXC geo-blocked on GCP Frankfurt)
         self.mexc = MexcClient(

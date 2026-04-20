@@ -63,6 +63,7 @@ _SYMBOL_MAP: Dict[str, str] = {
     "WLD-USD":       "WLDUSDT",
     "HBAR-USD":      "HBARUSDT",
     "ATOM-USD":      "ATOMUSDT",
+    "TRIA-USD":      "TRIAUSDT",
 }
 
 _FUNDING_CACHE_TTL = 300  # 5 minutes
