@@ -16,10 +16,12 @@ _CRYPTO_KEYWORDS = {
     "BTC", "ETH", "SOL", "BNB", "AVAX", "CRYPTO", "BITCOIN",
     "ETHEREUM", "SOLANA", "FED", "RATE", "INFLATION", "DOGE",
     "ARB", "OP", "PEPE", "DEFI", "NFT", "BLOCKCHAIN", "COINBASE",
-    "BINANCE", "TRUMP", "TARIFF", "INTEREST RATE", "RECESSION",
+    "BINANCE", "INTEREST RATE",
+    # TRUMP / TARIFF / RECESSION removed — match political markets, not crypto price markets
 }
 
 _MIN_HOURS_TO_EXPIRY = 2.0   # skip markets expiring < 2h from now
+_MAX_BETS_PER_SCAN   = 15    # hard cap — quality over quantity
 
 
 @dataclass
@@ -81,6 +83,7 @@ class MarketScanner:
         self.engine = prob_engine
         self.sizer = kelly_sizer
         self.min_edge = min_edge
+        logger.info("market_scanner_init", min_edge=min_edge, max_bets=_MAX_BETS_PER_SCAN)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -156,14 +159,17 @@ class MarketScanner:
         logger.info("scanning_polymarket", asset=asset, direction=market_direction)
 
         raw_markets = await self.get_public_markets()
+        logger.info("filter_stage", stage="total_fetched", count=len(raw_markets))
 
         # Filter to crypto-relevant with valid price and sufficient time to expiry
+        after_asset = 0
         relevant = []
         for m in raw_markets:
             q = m.get("question", "")
             tags = m.get("tags", [])
             if not self._is_crypto_relevant(q, tags):
                 continue
+            after_asset += 1
             yes_price = _parse_yes_price(m)
             if yes_price is None or yes_price <= 0 or yes_price >= 1:
                 continue
@@ -175,7 +181,8 @@ class MarketScanner:
                 continue
             relevant.append((m, yes_price, expiry_ts))
 
-        logger.info("polymarket_relevant_markets", count=len(relevant))
+        logger.info("filter_stage", stage="after_asset_filter",   count=after_asset)
+        logger.info("filter_stage", stage="after_horizon_filter", count=len(relevant))
 
         opportunities: List[BetOpportunity] = []
         funding_rate_pct = funding_rates.get(asset)
@@ -198,6 +205,11 @@ class MarketScanner:
 
                 p_augur  = prob_res.probability
                 p_market = yes_price
+
+                # No real signals → p_augur defaults to 0.50 → skip to avoid
+                # fake edge from market price deviation alone
+                if prob_res.n_signals == 0:
+                    continue
 
                 edge_yes = p_augur - p_market
                 edge_no  = p_market - p_augur
@@ -230,13 +242,20 @@ class MarketScanner:
                             expiry=expiry_ts,
                         )
                         opportunities.append(opp)
-                        logger.info("opportunity_found",
-                                    question=question[:60], side=side,
-                                    edge=round(edge, 3), size=size)
+                        if len(opportunities) <= 5:
+                            logger.info("bet_probability_sample",
+                                        question=question[:60], side=side,
+                                        p_augur=p_augur, p_market=p_market,
+                                        edge=round(edge, 3),
+                                        n_signals=prob_res.n_signals,
+                                        signals=prob_res.signals_breakdown)
 
             except Exception as e:
                 logger.warning("market_scan_item_error", error=str(e))
                 continue
 
+        logger.info("filter_stage", stage="after_edge_filter", count=len(opportunities))
+
         opportunities.sort(key=lambda o: o.edge, reverse=True)
+        opportunities = opportunities[:_MAX_BETS_PER_SCAN]
         return opportunities
