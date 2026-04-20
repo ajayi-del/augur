@@ -19,25 +19,25 @@ from typing import Dict, Optional
 logger = structlog.get_logger(__name__)
 
 _SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
-_COINGECKO_URL  = "https://api.coingecko.com/api/v3/simple/price"
+_BYBIT_TICKERS  = "https://api.bybit.com/v5/market/tickers"
 
-# CoinGecko ID → canonical symbol
-_COINGECKO_IDS: Dict[str, str] = {
-    "solana":           "SOL",
-    "bitcoin":          "BTC",
-    "ethereum":         "ETH",
-    "dogecoin":         "DOGE",
-    "sui":              "SUI",
-    "arbitrum":         "ARB",
-    "optimism":         "OP",
-    "avalanche-2":      "AVAX",
-    "bnb":              "BNB",
-    "pepe":             "PEPE",
-    "bonk":             "BONK",
+# Bybit linear symbol → canonical symbol
+_BYBIT_SYMBOLS: Dict[str, str] = {
+    "SOLUSDT":   "SOL",
+    "BTCUSDT":   "BTC",
+    "ETHUSDT":   "ETH",
+    "DOGEUSDT":  "DOGE",
+    "SUIUSDT":   "SUI",
+    "ARBUSDT":   "ARB",
+    "OPUSDT":    "OP",
+    "AVAXUSDT":  "AVAX",
+    "BNBUSDT":   "BNB",
+    "PEPEUSDT":  "PEPE",
+    "BONKUSDT":  "BONK",
 }
 
 _TPS_CACHE_TTL   = 60    # seconds
-_PRICE_CACHE_TTL = 30    # seconds (CoinGecko free tier: 30 req/min)
+_PRICE_CACHE_TTL = 15    # seconds — Bybit public API has no rate limit concerns
 
 _HIGH_TPS_THRESHOLD = 3000   # strong network activity above this
 _DIV_THRESHOLD_PCT  = 0.30   # minimum divergence to flag arbitrage
@@ -90,42 +90,44 @@ class SolanaBridge:
             logger.warning("solana_tps_error", error=str(e))
         return 0.0
 
-    # ── CoinGecko market prices ───────────────────────────────────────────────
+    # ── Bybit market prices ──────────────────────────────────────────────────
 
     async def get_jupiter_prices(self) -> Dict[str, float]:
         """
-        {symbol: usd_price} from CoinGecko simple price API.
-        Replaces Jupiter (jup.ag DNS fails on GCP Frankfurt).
-        Returns empty dict on error — callers must handle gracefully.
+        {symbol: usd_price} from Bybit public linear tickers API.
+        No API key required. Returns empty dict on error.
         """
         if time.time() - self._price_cached_at < _PRICE_CACHE_TTL and self._price_cache:
             return dict(self._price_cache)
 
         prices: Dict[str, float] = {}
-        ids_str = ",".join(_COINGECKO_IDS.keys())
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
                 async with s.get(
-                    _COINGECKO_URL,
-                    params={"ids": ids_str, "vs_currencies": "usd"},
+                    _BYBIT_TICKERS,
+                    params={"category": "linear"},
                 ) as r:
                     if r.status == 200:
                         data = await r.json(content_type=None)
-                        for cg_id, sym in _COINGECKO_IDS.items():
-                            entry = data.get(cg_id, {})
-                            p = float(entry.get("usd", 0.0))
-                            if p > 0:
-                                prices[sym] = p
+                        for item in data.get("result", {}).get("list", []):
+                            sym = _BYBIT_SYMBOLS.get(item.get("symbol", ""))
+                            if sym:
+                                try:
+                                    p = float(item.get("lastPrice", 0))
+                                    if p > 0:
+                                        prices[sym] = p
+                                except (ValueError, TypeError):
+                                    pass
                     else:
-                        logger.warning("coingecko_non_200", status=r.status)
+                        logger.warning("bybit_tickers_non_200", status=r.status)
         except Exception as e:
-            logger.warning("coingecko_price_error", error=str(e))
+            logger.warning("bybit_prices_error", error=str(e))
 
         if prices:
             self._price_cache     = prices
             self._price_cached_at = time.time()
-            logger.debug("coingecko_prices_fetched", symbols=list(prices.keys()))
+            logger.debug("bybit_prices_fetched", symbols=list(prices.keys()))
 
         return dict(prices)
 
