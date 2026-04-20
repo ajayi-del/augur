@@ -42,7 +42,6 @@ class AriaState:
 @dataclass
 class AugurState:
     active_bets: List[Dict] = field(default_factory=list)
-    open_positions: List[Dict] = field(default_factory=list)
     active_polymarket_bets: List[Dict] = field(default_factory=list)
     etf_flow_direction: str = "neutral"
     active_news_events: List[Dict] = field(default_factory=list)
