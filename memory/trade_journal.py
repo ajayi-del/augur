@@ -1,0 +1,387 @@
+"""
+Trade Journal
+
+Logs every execution decision AUGUR makes.
+Persists to JSON file in logs/ directory.
+v1.3 Hardened: Uses non-blocking write queue to prevent IO-bound races.
+"""
+
+import os
+import json
+import uuid
+import asyncio
+import aiofiles
+import structlog
+import dataclasses
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+from core.clock import exchange_clock
+
+logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class TradeRecord:
+    """Schema definition for a trade journal entry.
+
+    Used for type-checking and static analysis.  The live journal stores
+    plain dicts for flexibility; TradeRecord documents the canonical field set
+    including all philosophical layer fields added in v1.3+.
+    """
+    entry_id: str = ""
+    timestamp_ms: int = 0
+    symbol: str = ""
+    direction: str = ""
+    approved: bool = False
+    coherence_score: float = 0.0
+    raw_score: float = 0.0
+    size_multiplier: float = 0.0
+    macro_bias: str = "unknown"
+    regime: str = "unknown"
+    market_type: str = "unknown"
+    sweep: str = "none"
+    reclaim: bool = False
+    imbalance: float = 0.0
+    divergence: str = "none"
+    funding_class: str = "neutral"
+    strategy_tag: str = "unknown"
+    cascade_phase: str = "none"
+    # Philosophical layer fields (v1.3+)
+    personality: Optional[str] = None
+    kant_structure: Optional[str] = None
+    conviction: Optional[float] = None
+    will_state: Optional[str] = None
+    order_type_used: Optional[str] = None
+    # Outcome fields
+    outcome: Optional[str] = None
+    pnl_usd: Optional[float] = None
+    pnl_net_usd: Optional[float] = None
+    pnl_r: Optional[float] = None
+    hold_time_ms: Optional[int] = None
+    closed_at_ms: Optional[int] = None
+    # Institutional Audit fields (v2.1)
+    brier_score: Optional[float] = None
+    reasoning_tree: Optional[Dict[str, Any]] = None
+
+
+class AUGURJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if dataclasses.is_dataclass(obj):
+            return dataclasses.asdict(obj)
+        if hasattr(obj, 'model_dump'):
+            return obj.model_dump()
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
+
+class TradeJournal:
+    """
+    Logs every execution decision AUGUR makes
+    whether approved or rejected.
+    Uses an internal asyncio.Queue to ensure non-blocking disk writes.
+    """
+    
+    def __init__(self, log_dir: str = "./logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        
+        self.entries: List[Dict[str, Any]] = []
+        self._current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._journal_file = self.log_dir / f"trade_journal_{self._current_date}.json"
+        
+        # v1.3 Write Queue
+        self._write_queue = asyncio.Queue()
+        self._is_active = True
+        self._writer_task: Optional[asyncio.Task] = None
+        
+    def start_writer(self):
+        """Starts the background writer task."""
+        if self._writer_task is None:
+            self._writer_task = asyncio.create_task(self._write_loop())
+            logger.info("trade_journal_writer_started")
+
+    async def stop_writer(self):
+        """Gracefully stops the writer, ensuring all pending writes are flushed."""
+        self._is_active = False
+        await self._write_queue.put("FLUSH") # Signal final flush
+        if self._writer_task:
+            await self._writer_task
+            self._writer_task = None
+        logger.info("trade_journal_writer_stopped")
+
+    def log_decision(
+        self,
+        state: Any,  # MarketState
+        candidate: Any,  # TradeCandidate
+        approved: bool,
+        reason: str,
+        cal_state: Any = None,    # CalendarState
+        personality: str = None,  # e.g. "SCOUT", "APEX", "FLOW"
+        kant_structure: str = None,   # e.g. "trend", "accumulation"
+        conviction: float = None,     # 0.0–1.0
+        will_state: str = None,       # e.g. "neutral", "conservative"
+        order_type_used: str = None,  # "limit" | "market" | "probe"
+        reasoning_tree: Dict[str, Any] = None, # JSON Causal Tree
+    ) -> str:
+        """
+        Creates entry, puts in write queue.
+        Returns entry_id.
+        """
+        entry_id = str(uuid.uuid4())
+        # Use exchange-synced clock so journal timestamps match exchange trade history.
+        # Falls back to local time if clock not yet synced (early startup entries).
+        _now_ms = exchange_clock.now_ms()
+        _now_iso = exchange_clock.now_iso()
+
+        entry = {
+            "entry_id": entry_id,
+            "timestamp_ms": _now_ms,
+            "timestamp_iso": _now_iso,
+            "symbol": getattr(state, 'symbol', "UNKNOWN"),
+            "direction": getattr(candidate, 'side', "none"),
+            "coherence_score": getattr(state, 'weighted_score', getattr(state, 'coherence_score', 0)),
+            "raw_score": getattr(state, 'raw_score', getattr(state, 'coherence_score', 0)),
+            "size_multiplier": getattr(state, 'size_multiplier', 0.0),
+            
+            # v1.2 Quant Fields
+            "cluster_validated": getattr(state, 'cluster_validated', False),
+            "cluster_strength": getattr(state, 'cluster_strength', 0.0),
+            "market_hours_gate": getattr(state, 'market_hours_gate', True),
+            "golden_stop_used": False,
+            "golden_stop_price": None,
+            "tp1_level_stop_used": False,
+
+            # Signal states at time of decision
+            "macro_bias": getattr(state, 'macro_bias', "unknown"),
+            "regime": getattr(state, 'regime', "unknown"),
+            "market_type": getattr(state, 'market_type', "unknown"),
+            "sweep": getattr(state, 'sweep', "none"),
+            "reclaim": getattr(state, 'reclaim', False),
+            "imbalance": getattr(state, 'imbalance', 0.0),
+            "divergence": getattr(state, 'divergence', "none"),
+            "funding_class": getattr(state, 'funding_class', "neutral"),
+            "mag_active": getattr(state, 'mag_active', False),
+            
+            # v1.3 Calendar Fields
+            "calendar_regime": getattr(cal_state, 'regime', "unknown") if cal_state else "unknown",
+            "calendar_size_mult": getattr(cal_state, 'size_multiplier', 1.0) if cal_state else 1.0,
+            "calendar_stop_mult": getattr(cal_state, 'stop_atr_multiplier', 1.0) if cal_state else 1.0,
+            "calendar_event_type": getattr(cal_state, 'nearest_event_type', None) if cal_state else None,
+            "calendar_hours_to_event": getattr(cal_state, 'hours_to_event', None) if cal_state else None,
+            "calendar_reason": getattr(cal_state, 'reason', "not_provided") if cal_state else "not_provided",
+            
+            # v1.3 Unified Multiplier Chain
+            "coherence_mult": getattr(state, "coherence_mult", 1.0),
+            "freshness_mult": getattr(state, "freshness_mult", 1.0),
+            "calendar_mult": getattr(state, "calendar_mult", 1.0),
+            "allocation_mult": getattr(state, "allocation_mult", 1.0),
+            
+            # v1.3 Quant Fix Metadata
+            "slippage_expected_usd": getattr(state, "slippage_expected_usd", 0.0),
+            "funding_cost_est_usd": getattr(state, "funding_cost_est_usd", 0.0),
+
+            # v1.9 Cascade Intelligence Fields
+            "strategy_tag": getattr(state, "strategy_tag", "unknown"),
+            "cascade_phase": getattr(state, "cascade_phase", "none"),
+            "cascade_notional_usd": getattr(state, "cascade_notional_usd", 0.0),
+            "cascade_direction": getattr(state, "cascade_direction", ""),
+            "aftermath_signals": getattr(state, "aftermath_signals", []),
+            "tier8_cascade_fired": getattr(state, "tier8_cascade_fired", False),
+            "tier7_cross_venue_bonus": getattr(state, "tier7_cross_venue_bonus", 0.0),
+
+            # Execution result
+            "approved": approved,
+            "reject_reason": reason if not approved else None,
+            
+            # If approved and placed:
+            "entry_price": getattr(candidate, 'entry_price', None) if approved else None,
+            "stop_price": getattr(candidate, 'stop_price', None) if approved else None,
+            "tp1_price": getattr(candidate, 'tp1_price', None) if approved else None,
+            "tp2_price": getattr(candidate, 'tp2_price', None) if approved else None,
+            "tp3_price": getattr(candidate, 'tp3_price', None) if approved else None,
+            "position_size": getattr(candidate, 'size', None) if approved else None,
+            "initial_margin": getattr(candidate, 'initial_margin', None) if approved else None,
+            "leverage": getattr(candidate, 'leverage', None) if approved else None,
+            
+            # Philosophical layer fields (Kant + Nietzsche)
+            "personality":      personality,
+            "kant_structure":   kant_structure,
+            "conviction":       conviction,
+            "will_state":       will_state,
+            "order_type_used":  order_type_used,
+            "reasoning_tree":   reasoning_tree or {},
+            "brier_score":      None,
+
+            # Prediction Market Telemetry (v2.0)
+            "prediction_market_state": getattr(candidate, "prediction_market_state", "none"),
+            "prediction_market_score": getattr(candidate, "prediction_market_score", 0.0),
+            "independence_factor": getattr(candidate, "independence_factor", 0.0),
+            "aria_was_present": getattr(candidate, "aria_was_present", False),
+            "aria_direction": getattr(candidate, "aria_direction", None),
+
+            # Outcome (filled in when trade closes):
+            "outcome": None,
+            "pnl_usd": None,
+            "pnl_net_usd": None,
+            "pnl_r": None,
+            "hold_time_ms": None,
+            "closed_at_ms": None
+        }
+        
+        self.entries.append(entry)
+        self.save_nonblocking()
+        
+        return entry_id
+    
+    def update_outcome(
+        self,
+        entry_id: str,
+        outcome: str,
+        pnl_usd: Optional[float] = None,
+        closed_at_ms: Optional[int] = None,
+        pnl_net_usd: Optional[float] = None
+    ) -> None:
+        """Finds entry, updates outcome, triggers non-blocking save."""
+        for entry in self.entries:
+            if entry["entry_id"] == entry_id:
+                entry["outcome"] = outcome
+                entry["pnl_usd"] = pnl_usd
+                entry["pnl_net_usd"] = pnl_net_usd if pnl_net_usd is not None else pnl_usd
+                entry["closed_at_ms"] = closed_at_ms
+                
+                target_pnl = entry["pnl_net_usd"]
+                if target_pnl is not None and entry.get("initial_margin"):
+                    entry["pnl_r"] = target_pnl / entry["initial_margin"]
+                
+                if closed_at_ms is not None:
+                    entry["hold_time_ms"] = closed_at_ms - entry["timestamp_ms"]
+                
+                # Brier Score Calibration (p-f)^2 for prediction markets
+                if outcome in ("win", "loss") and entry.get("conviction") is not None:
+                    actual = 1.0 if outcome == "win" else 0.0
+                    probability = entry["conviction"]
+                    entry["brier_score"] = (probability - actual) ** 2
+                
+                self.save_nonblocking()
+                return
+        
+        logger.error("journal_entry_not_found", entry_id=entry_id)
+
+    def save_nonblocking(self) -> None:
+        """Pushes a 'SAVE' signal to the write queue."""
+        if self._is_active:
+            try:
+                self._write_queue.put_nowait("SAVE")
+            except asyncio.QueueFull:
+                logger.warning("journal_write_queue_full")
+
+    async def _write_loop(self):
+        """Background loop that handles disk writes."""
+        while self._is_active or not self._write_queue.empty():
+            try:
+                signal = await self._write_queue.get()
+                if signal in ["SAVE", "FLUSH"]:
+                    await self._perform_disk_write()
+                self._write_queue.task_done()
+                
+                if signal == "FLUSH" and not self._is_active:
+                    break
+            except Exception as e:
+                logger.error("journal_write_loop_error", error=str(e))
+                await asyncio.sleep(1)
+
+    async def _perform_disk_write(self):
+        """The actual async disk write operation."""
+        current_date = exchange_clock.now_date_str()
+        if current_date != self._current_date:
+            self._current_date = current_date
+            self._journal_file = self.log_dir / f"trade_journal_{self._current_date}.json"
+        
+        try:
+            temp_file = self._journal_file.with_suffix(".tmp")
+            async with aiofiles.open(temp_file, mode='w') as f:
+                await f.write(json.dumps(self.entries, indent=2, cls=AUGURJSONEncoder))
+                await f.flush()
+
+            # Atomic rename — guard against race where another coroutine already renamed
+            if temp_file.exists():
+                os.replace(temp_file, self._journal_file)
+        except Exception as e:
+            logger.error("journal_disk_write_failed", error=str(e))
+
+    def get_all(self) -> List[Dict[str, Any]]:
+        return self.entries.copy()
+    
+    def get_open(self) -> List[Dict[str, Any]]:
+        return [e for e in self.entries if e.get("outcome") in [None, "open"]]
+    
+    def get_closed(self) -> List[Dict[str, Any]]:
+        # Only "win" / "loss" are real closed trades. "abandoned" entries are
+        # phantom signals that were never actually executed — they have pnl_usd=None
+        # and must never enter performance calculations.
+        return [e for e in self.entries if e.get("outcome") in ("win", "loss")]
+    
+    # Maximum entries kept in memory — protects against unbounded growth when a
+    # high-frequency signal loop logs every evaluation.  Open trades are always
+    # preserved; older closed/abandoned entries are trimmed on load.
+    _MAX_IN_MEMORY: int = 500
+
+    def load(self) -> None:
+        """Loads today's journal synchronously at startup.
+
+        Trims to _MAX_IN_MEMORY entries, always preserving all open trades so
+        position reconciliation at startup is never affected.  Reduces load time
+        from O(14 k) → O(500) and cuts memory footprint proportionally.
+        """
+        if self._journal_file.exists():
+            try:
+                with open(self._journal_file, 'r') as f:
+                    all_entries = json.load(f)
+                total = len(all_entries)
+                # Always keep open/unresolved entries regardless of position in list
+                open_entries   = [e for e in all_entries if e.get("outcome") in (None, "open")]
+                closed_entries = [e for e in all_entries if e not in open_entries]
+                # Trim closed history to fit budget, newest first
+                budget = max(0, self._MAX_IN_MEMORY - len(open_entries))
+                self.entries = open_entries + closed_entries[-budget:]
+                trimmed = total - len(self.entries)
+                logger.info("journal_loaded", entries=len(self.entries),
+                            total_on_disk=total, trimmed=trimmed)
+            except (json.JSONDecodeError, FileNotFoundError):
+                self.entries = []
+    def get_historical_analysis(self, agent_id: str, symbol: str) -> dict:
+        """
+        Calculates realized performance for a specific agent and symbol.
+        Used for the self-learning calibration loop.
+        """
+        relevant = [
+            e for e in self.entries 
+            if e.get("symbol") == symbol and (agent_id == "all" or e.get("agent_id") == agent_id)
+        ]
+        
+        closed = [e for e in relevant if e.get("outcome") in ("win", "loss")]
+        if not closed:
+            return {"win_rate": 0.5, "sample_size": 0, "total_pnl": 0.0}
+            
+        wins = [e for e in closed if e.get("outcome") == "win"]
+        win_rate = len(wins) / len(closed)
+        total_pnl = sum(e.get("pnl_usd", 0.0) or 0.0 for e in closed)
+        
+        # Profit Factor: Gross Win / Gross Loss
+        gross_win = sum(e.get("pnl_usd", 0.0) or 0.0 for e in closed if e.get("outcome") == "win")
+        gross_loss = abs(sum(e.get("pnl_usd", 0.0) or 0.0 for e in closed if e.get("outcome") == "loss"))
+        profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (2.0 if gross_win > 0 else 1.0)
+        
+        # Average Brier Score
+        brier_scores = [e["brier_score"] for e in closed if e.get("brier_score") is not None]
+        avg_brier = sum(brier_scores) / len(brier_scores) if brier_scores else 0.5
+        
+        return {
+            "win_rate": win_rate,
+            "sample_size": len(closed),
+            "total_pnl": total_pnl,
+            "profit_factor": profit_factor,
+            "avg_brier_score": avg_brier
+        }
