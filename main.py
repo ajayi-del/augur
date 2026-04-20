@@ -766,8 +766,10 @@ class AugurApplication:
                 else:
                     self._cached_balance = 300.0  # paper sentinel value
 
-                # Sync daily loss from kingdom drawdown
-                self._daily_loss_pct = abs(getattr(aria, "drawdown", 0.0) or 0.0)
+                # AUGUR tracks its own daily loss — not ARIA's drawdown.
+                # ARIA drawdown is already checked via aria_drawdown in Chancellor.
+                # Until AUGUR has journal-backed P&L, daily_loss_pct stays 0.
+                self._daily_loss_pct = 0.0
 
                 print(
                     f"\n\033[1;36m[AUGUR HEARTBEAT]\033[0m"

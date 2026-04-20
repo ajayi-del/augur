@@ -188,19 +188,30 @@ class StrategyRunner:
         final_size = kelly_base * decision.size_modifier
         final_size = round(max(min(final_size, _MAX_SIZE_USD), _MIN_SIZE_USD), 2)
 
+        # TP from mark price — CASCADE 1.5%, MOMENTUM 2.0%
+        mark = self.bybit_feed.get_mark_price(symbol)
+        tp_pct = 0.015 if signal.strategy == "PERP_CASCADE" else 0.020
+        if mark > 0:
+            tp1 = round(mark * (1 + tp_pct) if signal.direction == "long"
+                        else mark * (1 - tp_pct), 6)
+        else:
+            tp1 = 0.0
+
         try:
             result = await self.router.place_order(
                 symbol    = symbol,
                 direction = signal.direction,
                 size_usd  = final_size,
                 leverage  = 5,
+                tp1       = tp1,
             )
             logger.info(
                 "strategy_trade_placed",
                 symbol        = symbol,
                 strategy      = signal.strategy,
                 direction     = signal.direction,
-                size_usd      = final_size,
+                size_usd      = round(final_size, 2),
+                tp1           = round(tp1, 4) if tp1 else None,
                 order_id      = result.order_id,
                 venue         = result.venue,
                 chancellor    = decision.action,
