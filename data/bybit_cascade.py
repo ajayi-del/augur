@@ -117,6 +117,9 @@ _SYMBOL_MAP: Dict[str, str] = {
 
 _REVERSE_MAP = {v: k for k, v in _SYMBOL_MAP.items()}
 
+# ARIA universe bybit symbols for filtering
+_ARIA_UNIVERSE_BYBIT: Dict[str, str] = _SYMBOL_MAP
+
 
 class BybitCascadeEngine:
     """
@@ -166,17 +169,17 @@ class BybitCascadeEngine:
     async def start(self) -> None:
         """
         Connect and stream forever with fixed backoff reconnect.
-        Production-grade reconnection: [0, 1, 2, 5] seconds.
+        Production-grade reconnection: [2, 3, 5, 10, 10] seconds.
         Never gives up. Never exponential backoff.
         """
         logger.info("bybit_cascade_engine_starting",
                     symbols=len(_SYMBOL_MAP),
                     latency_target_ms=50,
-                    reconnect_delays=[0, 1, 2, 5],
+                    reconnect_delays=[2, 3, 5, 10, 10],
                     version="production_grade_v2")
         
         attempt = 0
-        delays = [0, 1, 2, 5]  # Fixed delays as requested
+        delays = [2, 3, 5, 10, 10]  # Fixed delays - never reconnect immediately
         
         while True:
             try:
@@ -258,55 +261,37 @@ class BybitCascadeEngine:
         ) as ws:
             logger.info("bybit_cascade_connected", url=_BYBIT_WS_URL)
             
-            # Subscribe one symbol at a time with validation
-            successful_subscriptions = []
-            failed_subscriptions = []
-            
-            for symbol in bybit_symbols:
-                try:
-                    logger.debug("bybit_subscribing_symbol", symbol=symbol)
-                    subscribe_msg = {
-                        "op": "subscribe",
-                        "args": [f"liquidation.{symbol}"]
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
+            # Subscribe to allLiquidation stream (market-wide)
+            try:
+                logger.info("bybit_cascade_subscribing_all_liquidations")
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": ["allLiquidation"]
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                
+                # Wait for subscription response
+                response = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                data = json.loads(response)
+                
+                if data.get("success"):
+                    logger.info("bybit_cascade_all_liquidations_subscribed", 
+                               response=data)
+                else:
+                    logger.error("bybit_cascade_all_liquidations_rejected", 
+                                response=data)
+                    return
                     
-                    # Wait for individual subscription response
-                    response = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                    data = json.loads(response)
-                    
-                    if data.get("success"):
-                        successful_subscriptions.append(symbol)
-                        logger.info("bybit_liq_subscribed", symbol=symbol)
-                    else:
-                        failed_subscriptions.append(symbol)
-                        logger.error("bybit_liq_rejected", 
-                                   symbol=symbol,
-                                   error=data.get("ret_msg", "Unknown error"))
-                    
-                    # Small delay to avoid rate limiting
-                    await asyncio.sleep(0.1)
-                    
-                except asyncio.TimeoutError:
-                    failed_subscriptions.append(symbol)
-                    logger.error("bybit_liq_timeout", symbol=symbol)
-                except json.JSONDecodeError as e:
-                    failed_subscriptions.append(symbol)
-                    logger.error("bybit_liq_decode_error", 
-                               symbol=symbol, error=str(e))
-                except Exception as e:
-                    failed_subscriptions.append(symbol)
-                    logger.error("bybit_liq_subscribe_error", 
-                               symbol=symbol, error=str(e))
-            
-            logger.info("bybit_cascade_subscription_complete",
-                       total=len(bybit_symbols),
-                       successful=len(successful_subscriptions),
-                       failed=len(failed_subscriptions),
-                       success_rate=round(len(successful_subscriptions)/len(bybit_symbols), 2))
-            
-            if not successful_subscriptions:
-                logger.error("bybit_cascade_no_successful_subscriptions")
+            except asyncio.TimeoutError:
+                logger.error("bybit_cascade_all_liquidations_timeout")
+                return
+            except json.JSONDecodeError as e:
+                logger.error("bybit_cascade_all_liquidations_decode_error", 
+                            error=str(e))
+                return
+            except Exception as e:
+                logger.error("bybit_cascade_all_liquidations_error", 
+                            error=str(e))
                 return
             
             # Start message queue and processor
@@ -462,8 +447,18 @@ class BybitCascadeEngine:
                 data = json.loads(msg)
                 topic = data.get("topic", "")
                 
-                if topic.startswith("liquidation."):
-                    await self._on_liquidation(data)
+                # Handle allLiquidation stream
+                if topic == "allLiquidation":
+                    liq_data = data.get("data", {})
+                    symbol = liq_data.get("symbol", "")
+                    
+                    # Only process ARIA universe symbols
+                    if symbol in _ARIA_UNIVERSE_BYBIT.values():
+                        await self._on_liquidation(data)
+                    else:
+                        logger.debug("bybit_liquidation_filtered", 
+                                    reason="not_in_aria_universe",
+                                    symbol=symbol)
                     
             except asyncio.TimeoutError:
                 logger.debug("bybit_processor_queue_timeout")
