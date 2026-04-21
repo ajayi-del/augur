@@ -261,24 +261,21 @@ class BybitCascadeEngine:
         ) as ws:
             logger.info("bybit_cascade_connected", url=_BYBIT_WS_URL)
 
-            # Subscribe per-symbol (Bybit supports liquidation.{symbol}, not allLiquidation)
-            # Batch into chunks of 10 to stay within the subscribe limit per message
-            chunk_size = 10
+            # Subscribe per-symbol individually so one invalid symbol can't block others
             subscribed = 0
-            for i in range(0, len(bybit_symbols), chunk_size):
-                chunk = bybit_symbols[i:i + chunk_size]
-                topics = [f"liquidation.{s}" for s in chunk]
-                await ws.send(json.dumps({"op": "subscribe", "args": topics}))
+            for sym in bybit_symbols:
+                topic = f"liquidation.{sym}"
+                await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
                 try:
-                    resp_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    resp_raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
                     resp = json.loads(resp_raw)
                     if resp.get("success"):
-                        subscribed += len(chunk)
+                        subscribed += 1
                     else:
-                        logger.warning("bybit_cascade_chunk_rejected",
-                                       topics=topics, response=resp)
+                        logger.debug("bybit_cascade_symbol_rejected",
+                                     symbol=sym, reason=resp.get("ret_msg", ""))
                 except asyncio.TimeoutError:
-                    logger.warning("bybit_cascade_chunk_timeout", topics=topics)
+                    logger.debug("bybit_cascade_symbol_timeout", symbol=sym)
 
             if subscribed == 0:
                 raise RuntimeError("bybit_cascade: no per-symbol subscriptions confirmed")
