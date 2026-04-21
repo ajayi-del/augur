@@ -190,7 +190,7 @@ class KingdomStateSync:
 
     def get_active_aria_bets(self, symbol: str) -> List[AgentBet]:
         """Returns non-expired ARIA bets for a specific symbol."""
-        aria = self.read_aria_state()
+        aria = self.read().aria
         now_ms = int(time.time() * 1000)
         bet_fields = AgentBet.__dataclass_fields__.keys()
         return [

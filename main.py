@@ -586,7 +586,7 @@ class AugurApplication:
             try:
                 # Wait for ARIA write event or fallback timeout
                 try:
-                    await asyncio.wait_for(self._kingdom_event.wait(), timeout=120.0)
+                    await asyncio.wait_for(self._kingdom_event.wait(), timeout=15.0)
                     # Measure latency from file mtime to our processing
                     try:
                         mtime_ms = int(self.kingdom.state_path.stat().st_mtime * 1000)
@@ -849,7 +849,7 @@ class AugurApplication:
 
             except Exception as e:
                 logger.error("heartbeat_error", error=str(e))
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

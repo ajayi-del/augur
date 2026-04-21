@@ -365,21 +365,22 @@ class BybitCascadeEngine:
                         has_liq=bool(liq))
             return
 
-        now_ms = int(time.time() * 1000)
-        side   = liq.get("side", "")
-        size   = float(liq.get("size", 0))
-        price  = float(liq.get("price", 0))
+        now_ms       = int(time.time() * 1000)
+        side         = liq.get("side", "")
+        raw_size     = float(liq.get("size", 0))   # token quantity (e.g. 6.47 ETH)
+        price        = float(liq.get("price", 0))
+        notional_usd = raw_size * price             # convert to USD on receipt
 
-        if size <= 0:
-            logger.debug("binance_liquidation_filtered", 
-                        reason="invalid_size",
-                        size=size,
-                        symbol=binance_symbol)
+        if raw_size <= 0 or notional_usd < 1_000:
+            logger.debug("binance_liquidation_filtered",
+                         reason="below_min_notional",
+                         symbol=binance_symbol,
+                         notional_usd=round(notional_usd, 0))
             return
 
-        # Add to rolling window (same as Bybit processing)
+        # Add to rolling window — store USD notional, not raw token size
         window = self._windows[aria_symbol]
-        window.append({"ts_ms": now_ms, "side": side, "size_usd": size * price})
+        window.append({"ts_ms": now_ms, "side": side, "size_usd": notional_usd})
 
         # Prune events older than 60s
         cutoff = now_ms - _WINDOW_MS
@@ -470,21 +471,22 @@ class BybitCascadeEngine:
                         has_liq=bool(liq))
             return
 
-        now_ms = int(time.time() * 1000)
-        side   = liq.get("side", "")
-        size   = float(liq.get("size", 0))
-        price  = float(liq.get("price", 0))
+        now_ms       = int(time.time() * 1000)
+        side         = liq.get("side", "")
+        size         = float(liq.get("size", 0))
+        price        = float(liq.get("price", 0))
+        notional_usd = size * price
 
-        if size <= 0:
-            logger.debug("bybit_liquidation_filtered", 
-                        reason="invalid_size",
-                        size=size,
-                        symbol=bybit_symbol)
+        if size <= 0 or notional_usd < 1_000:
+            logger.debug("bybit_liquidation_filtered",
+                         reason="below_min_notional",
+                         symbol=bybit_symbol,
+                         notional_usd=round(notional_usd, 0))
             return
 
         # Add to rolling window
         window = self._windows[aria_symbol]
-        window.append({"ts_ms": now_ms, "side": side, "size_usd": size * price})
+        window.append({"ts_ms": now_ms, "side": side, "size_usd": notional_usd})
 
         # Prune events older than 60s
         cutoff = now_ms - _WINDOW_MS
@@ -533,16 +535,40 @@ class BybitCascadeEngine:
         else:
             velocity_zscore = 0.0
         
-        # Early cascade detection
+        # Early cascade detection — velocity_zscore > 3.0 fires independently
+        # of the 60s window. A 10s burst that is 3× expected rate IS a cascade
+        # starting now. Do not wait for the window to fill.
         fire_cascade_early = False
         if velocity_zscore > 3.0:
             fire_cascade_early = True
             logger.info("bybit_velocity_cascade",
-                       symbol=symbol,
-                       velocity_zscore=round(velocity_zscore, 2),
-                       liq_10s=liq_10s,
-                       expected_10s=round(expected_10s, 1),
-                       note="early_detection_30s_ahead")
+                        symbol=symbol,
+                        velocity_zscore=round(velocity_zscore, 2),
+                        liq_10s=liq_10s,
+                        expected_10s=round(expected_10s, 1),
+                        note="early_detection_30s_ahead")
+            # Publish velocity-only whisper immediately — tier 2 minimum.
+            # ARIA reads this within 50ms via watchdog and boosts coherence.
+            _vel_whisper = {
+                "symbol":         symbol,
+                "direction":      direction,
+                "zscore":         round(zscore, 2),
+                "velocity_zscore": round(velocity_zscore, 2),
+                "notional_usd":   round(notional_60s, 0),
+                "phase":          "velocity_lead",
+                "tier":           max(2, self._classify_tier(zscore, notional_60s, "velocity_lead", direction) or 2),
+                "boost":          0.8,
+                "confidence":     round(min(velocity_zscore / 10.0, 0.90), 3),
+                "expires_ms":     now_ms + 90_000,
+                "source":         "velocity_early_detection",
+                "timestamp_ms":   now_ms,
+                "note":           "velocity_early_detection",
+            }
+            self.kingdom.publish_augur_data(f"whisper.{symbol}", _vel_whisper)
+            logger.info("augur_whisper_published",
+                        symbol=symbol, tier=_vel_whisper["tier"],
+                        boost=0.8, source="velocity_early_detection",
+                        velocity_zscore=round(velocity_zscore, 2))
 
         # Periodically update historical stats
         if time.time() - self._last_stat_update > _HIST_UPDATE_S:
@@ -552,19 +578,18 @@ class BybitCascadeEngine:
         phase  = self._detect_phase(symbol, zscore)
         score  = self._score_cascade(symbol, zscore, notional_60s, phase, direction)
 
-        # Enhanced threshold: use lower threshold for early velocity detection
+        # Gate: pass if EITHER standard zscore is sufficient OR velocity burst fires.
+        # velocity_zscore > 3.0 means the 10s rate is 3× baseline — that IS a cascade
+        # starting now. Never suppress it just because the 60s window has not filled.
         effective_threshold = _MIN_ZSCORE
-        if fire_cascade_early:
-            effective_threshold = 0.05  # Very low threshold for velocity triggers
-
-        if zscore < effective_threshold:
-            logger.debug("bybit_liquidation_filtered", 
-                        reason="below_zscore_threshold",
-                        symbol=symbol,
-                        zscore=round(zscore, 2),
-                        threshold=effective_threshold,
-                        velocity_zscore=round(velocity_zscore, 2))
-            return  # noise floor — not worth publishing
+        if zscore < effective_threshold and not fire_cascade_early:
+            logger.debug("bybit_liquidation_filtered",
+                         reason="below_zscore_threshold",
+                         symbol=symbol,
+                         zscore=round(zscore, 2),
+                         threshold=effective_threshold,
+                         velocity_zscore=round(velocity_zscore, 2))
+            return  # noise floor — velocity also quiet, not worth publishing
 
         # ── Publish to kingdom (intelligence always shared) ────────────────
         cascade_data = {
