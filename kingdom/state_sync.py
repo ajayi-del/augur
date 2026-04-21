@@ -333,6 +333,44 @@ class KingdomStateSync:
         except Exception:
             return default
 
+    def get_whisper(self, symbol: str) -> Optional[Dict]:
+        """
+        Read AUGUR's whisper for a symbol — a tier-classified Bybit cascade warning.
+        Returns None if no whisper or whisper has expired.
+        Used by ARIA to boost coherence on incoming cascade signals.
+        """
+        try:
+            now_ms = int(time.time() * 1000)
+            whisper = self.get_augur_data(f"whisper.{symbol}")
+            if not whisper:
+                return None
+            if whisper.get("expires_ms", 0) < now_ms:
+                return None
+            return whisper
+        except Exception:
+            return None
+
+    def get_aria_whisper(self) -> Optional[Dict]:
+        """
+        Read ARIA's execution whisper — written after a confirmed position open.
+        Stored at kingdom["aria_whisper"] (top-level, not under augur_data).
+        Returns None if missing or expired.
+        """
+        try:
+            with self.lock:
+                if not self.state_path.exists():
+                    return None
+                with open(self.state_path, "r") as f:
+                    data = json.load(f)
+            whisper = data.get("aria_whisper")
+            if not whisper:
+                return None
+            if whisper.get("expires_ms", 0) < int(time.time() * 1000):
+                return None
+            return whisper
+        except Exception:
+            return None
+
     def get_aria_cascade(self, symbol: str) -> Optional[Dict]:
         """
         Read ARIA's live cascade alert for a symbol.

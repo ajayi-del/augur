@@ -398,20 +398,64 @@ class AugurApplication:
                         # ARIA signal is implicit agreement until AUGUR earns its own record.
                         alignment = self.cross_feedback.get_alignment(aria_sym)
                         if alignment <= 0.52:
-                            aria_bet_dict = next(
-                                (b for b in aria_state.active_bets
-                                 if b.get("symbol") == aria_sym),
-                                None,
+                            # Patch 4 — AUGUR reads ARIA execution whisper for alignment.
+                            # ARIA writes aria_whisper to kingdom after confirmed fill.
+                            # If a fresh, direction-matching whisper exists, derive alignment
+                            # from ARIA's confirmed coherence instead of the active_bets proxy.
+                            _aria_whisper = self.kingdom.get_aria_whisper() or {}
+                            _wh_sym = _aria_whisper.get("symbol", "")
+                            _wh_dir = _aria_whisper.get("direction", "")
+                            _wh_exp = _aria_whisper.get("expires_ms", 0)
+                            _wh_coh = float(_aria_whisper.get("coherence", 0.0))
+                            _now_ms = int(time.time() * 1000)
+                            _dir_match = (
+                                (direction == "long"  and _wh_dir == "long") or
+                                (direction == "short" and _wh_dir == "short")
                             )
-                            aria_coh = (aria_bet_dict.get("coherence", 0.0)
-                                        if aria_bet_dict else 0.0)
-                            if aria_coh > 7.0:
-                                alignment = 0.65
-                            elif aria_coh > 5.0:
-                                alignment = 0.55
-                        coherence = round(
-                            min((tps / 600.0 if tps > 0 else 3.0) * (0.5 + alignment), 10.0), 2
+                            if (_wh_sym == aria_sym and _dir_match
+                                    and _wh_exp > _now_ms and _wh_coh > 0.0):
+                                alignment = round(min(0.50 + (_wh_coh / 20.0), 0.85), 3)
+                                logger.info("augur_aria_whisper_used",
+                                            symbol=aria_sym, aria_coherence=_wh_coh,
+                                            alignment=alignment,
+                                            personality=_aria_whisper.get("personality", "?"))
+                            else:
+                                # Fallback: proxy from ARIA's active bet coherence
+                                aria_bet_dict = next(
+                                    (b for b in aria_state.active_bets
+                                     if b.get("symbol") == aria_sym),
+                                    None,
+                                )
+                                aria_coh = (aria_bet_dict.get("coherence", 0.0)
+                                            if aria_bet_dict else 0.0)
+                                if aria_coh > 7.0:
+                                    alignment = 0.65
+                                elif aria_coh > 5.0:
+                                    alignment = 0.55
+                        # ── AUGUR coherence — Kantian structural soundness ────
+                        # Per-symbol Bybit cascade data (more precise than global alert)
+                        _bc = self.kingdom.get_augur_data(f"bybit_cascade.{aria_sym}")
+                        _bybit_z = float(_bc.get("zscore", 0.0)) if _bc and _bc.get("active") else 0.0
+
+                        # Kant factors — four dimensions of structural truth [0, 1]
+                        _ob_conviction  = abs(agg - 0.50) * 2.0                   # OB one-sided?
+                        _mom_strength   = min(abs(pct_30s) / 0.30, 1.0)           # price moving ≥0.3%?
+                        _cascade_factor = min(_bybit_z / 4.0, 1.0)               # Bybit cascade real?
+                        _fund_clarity   = max(0.0, 1.0 - abs(fund_rate) * 40.0)  # funding clean?
+
+                        # Weighted Kantian base [0, 10]
+                        _kant_score = (
+                            _ob_conviction  * 3.5 +   # 35% — what is market doing?
+                            _mom_strength   * 2.5 +   # 25% — is price confirming?
+                            _cascade_factor * 2.5 +   # 25% — is cascade structural?
+                            _fund_clarity   * 1.5      # 15% — is structure clean?
                         )
+
+                        # Nietzsche will multiplier — TPS health × alignment track record
+                        _tps_will  = max(0.50, min(tps / 3000.0, 1.20)) if tps > 0 else 0.60
+                        _will_mult = _tps_will * (0.70 + alignment * 0.30)
+
+                        coherence = round(min(_kant_score * _will_mult, 10.0), 2)
 
                         # ── Build AugurSignal ──────────────────────────────────
                         edge = round(deviation * 2.0, 4)  # probability edge

@@ -532,8 +532,12 @@ class BybitCascadeEngine:
             direction = "mixed"
 
         # === VELOCITY DETECTION (10-second window) ===
+        # Use the latest event already stored in window (appended by _on_liquidation)
         velocity_window = self._velocity_windows[symbol]
-        velocity_window.append({"ts_ms": now_ms, "side": side, "size_usd": size * price})
+        if window:
+            last = window[-1]
+            velocity_window.append({"ts_ms": now_ms, "side": last.get("side", ""),
+                                    "size_usd": last.get("size_usd", 0.0)})
         
         # Prune velocity window to 10 seconds
         velocity_cutoff = now_ms - 10_000  # 10 seconds
@@ -598,6 +602,37 @@ class BybitCascadeEngine:
             "early_detection": fire_cascade_early if 'fire_cascade_early' in locals() else False,
         }
         self.kingdom.publish_augur_data(f"bybit_cascade.{symbol}", cascade_data)
+
+        # ── Whisper to ARIA — tier-classified cascade intelligence ─────────────
+        # ARIA reads this on every signal cycle and applies a coherence boost
+        # if the symbol, direction, and tier match its current signal.
+        _WHISPER_BOOST = {1: 1.5, 2: 0.8, 3: 0.3}
+        tier = self._classify_tier(zscore, notional_60s, phase, direction)
+        if tier is not None:
+            whisper = {
+                "symbol":       symbol,
+                "direction":    direction,   # "bullish" | "bearish"
+                "zscore":       round(zscore, 2),
+                "notional_usd": round(notional_60s, 0),
+                "phase":        phase,
+                "tier":         tier,
+                "boost":        _WHISPER_BOOST[tier],
+                "confidence":   round(score, 3),
+                "expires_ms":   now_ms + 90_000,   # 90s — propagation window
+                "source":       "bybit_cascade_lead",
+                "timestamp_ms": now_ms,
+            }
+            self.kingdom.publish_augur_data(f"whisper.{symbol}", whisper)
+            logger.info(
+                "augur_whisper_published",
+                symbol    = symbol,
+                tier      = tier,
+                boost     = _WHISPER_BOOST[tier],
+                direction = direction,
+                zscore    = round(zscore, 2),
+                notional  = round(notional_60s, 0),
+                expires_s = 90,
+            )
 
         logger.info(
             "bybit_cascade_evaluated",
@@ -745,6 +780,26 @@ class BybitCascadeEngine:
         new_var  = alpha * diff ** 2 + (1 - alpha) * curr_var
         self._hist_std[symbol]  = max(math.sqrt(new_var), 0.5)
         self._last_stat_update  = time.time()
+
+    @staticmethod
+    def _classify_tier(zscore: float, notional: float, phase: str, direction: str) -> Optional[int]:
+        """
+        Tier 1 — Act immediately: zscore>3.5, notional>$500k, expansion phase, clear direction.
+        Tier 2 — Act with confirmation: zscore≥2.5, notional>$200k, clear direction.
+        Tier 3 — Monitor: zscore≥1.5, any notional, clear direction.
+        None   — Ignore: mixed direction, exhaustion phase, or below noise floor.
+
+        Exhaustion is AUGUR's domain (reversal trade) — ARIA should not follow.
+        """
+        if direction == "mixed" or phase == "exhaustion":
+            return None
+        if zscore > 3.5 and notional > 500_000 and phase == "expansion":
+            return 1
+        if zscore >= 2.5 and notional > 200_000:
+            return 2
+        if zscore >= 1.5:
+            return 3
+        return None
 
     def _detect_phase(self, symbol: str, zscore: float) -> str:
         """
