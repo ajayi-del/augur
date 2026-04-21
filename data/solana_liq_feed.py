@@ -38,12 +38,15 @@ class DriftLiquidationFeed:
         self.kingdom = kingdom
     
     async def start(self):
+        _delay = 30
         while True:
             try:
                 await self._stream()
+                _delay = 30
             except Exception as e:
                 logger.warning("drift_liq_reconnecting", error=str(e))
-                await asyncio.sleep(3)
+                await asyncio.sleep(min(_delay, 300))
+                _delay = min(_delay * 2, 300)
     
     async def _stream(self):
         async with websockets.connect(
@@ -123,39 +126,31 @@ class PythVelocityFeed:
         self._last_update: Dict[str, float] = {}
     
     async def monitor_velocity(self):
+        _consecutive_failures = 0
         while True:
             try:
                 for symbol, feed_id in self.PRICE_FEEDS.items():
                     price = await self._get_price(feed_id)
                     velocity = self._compute_velocity(symbol, price)
-                    
+
                     if abs(velocity) > 0.003:
-                        # 0.3% price move in 10s
-                        # Liquidations incoming
-                        
                         direction = "bearish" if velocity < 0 else "bullish"
-                        
                         logger.info("pyth_velocity_warning",
-                                   symbol=symbol,
-                                   velocity_pct=velocity * 100,
-                                   direction=direction,
-                                   note="liquidations_expected_soon")
-                        
-                        await self.kingdom.publish_augur({
-                            "pyth_velocity": {
-                                "symbol": symbol,
-                                "direction": direction,
-                                "velocity_pct": velocity * 100,
-                                "warning": True,
-                                "timestamp_ms": int(time.time() * 1000)
-                            }
-                        })
-                
+                                    symbol=symbol,
+                                    velocity_pct=velocity * 100,
+                                    direction=direction,
+                                    note="liquidations_expected_soon")
+
+                _consecutive_failures = 0
                 await asyncio.sleep(10)
-                
+
             except Exception as e:
-                logger.error("pyth_velocity_error", error=str(e))
-                await asyncio.sleep(5)
+                _consecutive_failures += 1
+                # Only log once per backoff window — don't spam
+                if _consecutive_failures == 1:
+                    logger.warning("pyth_velocity_unavailable", error=str(e),
+                                   note="backing off — feed IDs may be stale")
+                await asyncio.sleep(min(30 * _consecutive_failures, 300))
     
     async def _get_price(self, feed_id: str) -> float:
         """Get current price from Pyth."""
@@ -172,9 +167,9 @@ class PythVelocityFeed:
                         price_data = data[0]
                         return float(price_data.get("price", {}).get("price", 0))
                     
-        except Exception as e:
-            logger.error("pyth_price_fetch_error", feed_id=feed_id, error=str(e))
-        
+        except Exception:
+            pass  # caller logs aggregate failure
+
         return 0.0
     
     def _compute_velocity(self, symbol: str, current_price: float) -> float:
