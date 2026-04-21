@@ -177,36 +177,42 @@ class BybitClient:
         tp3: float = 0.0,
         leverage: int = 5,
     ) -> OrderResult:
-        leverage = min(leverage, 5)
+        leverage = max(5, min(leverage, 15))  # Nietzsche selects 5–15x
 
         if self.mode == "paper":
             oid = f"BB-PAPER-{uuid.uuid4().hex[:8]}"
             logger.info(
                 "bybit_paper_order",
                 symbol=symbol, direction=direction, size_usd=size_usd,
+                leverage=leverage, tp1=round(tp1, 4) if tp1 else None,
             )
             return OrderResult(
                 order_id=oid, venue="bybit_paper", symbol=symbol,
                 direction=direction, size_usd=size_usd, entry=entry, status="filled",
             )
 
-        bybit_sym = self._to_bybit_symbol(symbol)
-        side      = "Buy" if direction == "long" else "Sell"
+        bybit_sym  = self._to_bybit_symbol(symbol)
+        side       = "Buy" if direction == "long" else "Sell"
+        ref_price  = entry if entry > 0 else 0.0
 
-        if entry > 0:
-            raw_qty = size_usd / entry
-            # Bybit qty precision varies by price tier (step size from instrument info)
-            # Heuristic: integer for sub-$1 and sub-$10 assets; decimals for majors
-            if entry < 1:
-                qty = int(raw_qty)          # OP, PEPE etc — integer contracts
-            elif entry < 10:
+        if ref_price > 0:
+            raw_qty = size_usd / ref_price
+            # Qty precision: Bybit step sizes vary by price tier
+            if ref_price < 1:
+                qty = int(raw_qty)          # sub-$1 coins (PEPE, BONK) — integer
+            elif ref_price < 10:
                 qty = round(raw_qty, 1)
-            elif entry < 100:
+            elif ref_price < 100:
                 qty = round(raw_qty, 2)
             else:
                 qty = round(raw_qty, 3)
         else:
+            # No price provided — fall back to minimum tradable quantity
+            # Caller should always pass entry=mark_price for correct sizing
             qty = 1
+            logger.warning("bybit_order_no_entry_price",
+                           symbol=symbol, size_usd=size_usd,
+                           note="qty defaulting to 1 — pass entry=mark_price")
 
         await self._set_leverage(bybit_sym, leverage)
 
@@ -217,11 +223,15 @@ class BybitClient:
             "orderType":   "Market",
             "qty":         str(qty),
             "timeInForce": "IOC",
+            "positionIdx": 0,           # one-way mode (required for linear perps)
         }
         if stop > 0:
-            body["stopLoss"] = str(round(stop, 4))
+            body["stopLoss"]    = str(round(stop, 4))
+            body["slTriggerBy"] = "MarkPrice"   # MarkPrice avoids wick-triggered SL
         if tp1 > 0:
-            body["takeProfit"] = str(round(tp1, 4))
+            body["takeProfit"]  = str(round(tp1, 4))
+            body["tpTriggerBy"] = "MarkPrice"   # MarkPrice more stable than LastPrice
+            body["tpOrderType"] = "Market"      # close at market when TP triggers
 
         try:
             resp = await self._post("/v5/order/create", body)

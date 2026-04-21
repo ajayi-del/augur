@@ -56,6 +56,7 @@ from memory.cross_learning import CrossLearningEngine
 from execution.bybit_client import BybitClient
 from execution.routing_client import RoutingClient
 from intelligence.strategy_runner import StrategyRunner
+from intelligence.deep_intelligence import DeepIntelligenceAgent
 
 logger = structlog.get_logger()
 
@@ -162,6 +163,13 @@ class AugurApplication:
             bybit_cascade_engine=self.bybit_cascade,
         )
 
+        # Deep intelligence — DeepSeek-powered smart money analysis (6h cycle)
+        self.intel_agent = DeepIntelligenceAgent(
+            log_path = cfg.augur_log_path,
+            kingdom  = self.kingdom,
+            bridge   = self.bridge,
+        )
+
         # Strategy runner — PERP_CASCADE + PERP_MOMENTUM, 30s cycle
         self.strategy_runner = StrategyRunner(
             bybit_feed      = self.bybit_feed,
@@ -170,6 +178,7 @@ class AugurApplication:
             router          = self.router,
             get_balance     = lambda: self._cached_balance,
             get_daily_loss  = lambda: self._daily_loss_pct,
+            intel_agent     = self.intel_agent,
         )
 
         # Execution dedup — {symbol: last_executed_ms}
@@ -451,6 +460,17 @@ class AugurApplication:
                             _fund_clarity   * 1.5      # 15% — is structure clean?
                         )
 
+                        # DeepSeek errand-bird whisper — ambient probability boost
+                        # Boosts kant_score when the external observer agrees with AUGUR's direction
+                        _ds_whisper = self.kingdom.get_deepseek_bias(aria_sym)
+                        if (_ds_whisper and
+                                _ds_whisper.get("bias") == direction and
+                                _ds_whisper.get("strength", 0) >= 0.55):
+                            _ds_boost = min(_ds_whisper.get("strength", 0) * 0.5, 0.5)
+                            _kant_score = min(_kant_score + _ds_boost, 10.0)
+                            logger.debug("deepseek_whisper_kant_boost",
+                                         symbol=aria_sym, boost=round(_ds_boost, 3))
+
                         # Nietzsche will multiplier — TPS health × alignment track record
                         _tps_will  = max(0.50, min(tps / 3000.0, 1.20)) if tps > 0 else 0.60
                         _will_mult = _tps_will * (0.70 + alignment * 0.30)
@@ -688,17 +708,29 @@ class AugurApplication:
                         augur_dir  = augur_bet.direction  if augur_bet else None
 
                         total_exp, sym_exp = self._get_exposure_pcts(aria_bet.symbol)
+
+                        # Institutional backing: check if AUGUR's direction has hot signal
+                        has_institutional = False
+                        if augur_dir and hasattr(self, "intel_agent") and self.intel_agent:
+                            hot = self.intel_agent.get_hot_signal(aria_bet.symbol)
+                            has_institutional = (
+                                hot is not None
+                                and hot.direction == augur_dir
+                                and hot.conviction >= 0.65
+                            )
+
                         chancellor_decision = self.chancellor.adjudicate(
                             aria_direction=aria_bet.direction,
                             aria_coherence=aria_bet.coherence,
                             augur_direction=augur_dir,
                             augur_conviction=augur_conv,
-                            aria_drawdown=getattr(aria, "drawdown", 0.0) or 0.0,
+                            aria_drawdown=self._daily_loss_pct,  # AUGUR's own P&L only
                             daily_loss_pct=self._daily_loss_pct,
                             cascade_zscore=float(self._cascade_alert.get("zscore", 0.0)),
                             total_exposure_pct=total_exp,
                             symbol_exposure_pct=sym_exp,
                             balance=max(self._cached_balance, 0.0),
+                            has_institutional_signal=has_institutional,
                         )
 
                         if not chancellor_decision.augur_executes:
@@ -742,15 +774,36 @@ class AugurApplication:
                             tps_mult=tps_mult,
                         )
 
+                        # Hedge case: AUGUR trades its own direction (opposite to ARIA)
+                        # Normal case: AUGUR follows ARIA's direction
+                        trade_direction = aria_bet.direction
+                        if chancellor_decision.augur_hedges and augur_dir:
+                            trade_direction = augur_dir
+                            logger.info(
+                                "augur_institutional_hedge",
+                                symbol=aria_bet.symbol,
+                                aria_direction=aria_bet.direction,
+                                augur_direction=augur_dir,
+                                size_usd=size_usd,
+                            )
+
+                        mark = self.bybit_feed.get_mark_price(aria_bet.symbol)
+                        is_long = trade_direction == "long"
+                        tp_mark = round(mark * 1.015 if is_long else mark * 0.985, 6) if mark > 0 else 0.0
+                        sl_mark = round(mark * 0.990 if is_long else mark * 1.010, 6) if mark > 0 else 0.0
+
                         order = await self.router.place_order(
                             symbol=aria_bet.symbol,
-                            direction=aria_bet.direction,
+                            direction=trade_direction,
                             size_usd=size_usd,
+                            entry=mark if mark > 0 else 0.0,
+                            tp1=tp_mark,
+                            stop=sl_mark,
                         )
 
                         self._mark_executed(aria_bet.symbol, aria_bet.timestamp_ms)
                         self.kingdom.write_position(
-                            "augur", aria_bet.symbol, aria_bet.direction,
+                            "augur", aria_bet.symbol, trade_direction,
                             size_usd, order.venue,
                         )
                         self.outcome_resolver.register_position(
@@ -875,6 +928,7 @@ class AugurApplication:
                 self.cross_feedback.feedback_loop(),
                 self.heartbeat_loop(),
                 self.strategy_runner.run_forever(),
+                self.intel_agent.run_forever(),
             )
         finally:
             if self._kingdom_observer:

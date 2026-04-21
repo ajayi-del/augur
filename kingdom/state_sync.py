@@ -254,11 +254,45 @@ class KingdomStateSync:
         try:
             state = self.read()
             registry = state.position_registry
-            positions = registry.get(agent_id, [])
-            now_ms = int(time.time() * 1000)
-            return sum(1 for p in positions if now_ms - p.get("opened_ms", 0) < 4 * 3600 * 1000)
+            return len(registry.get(agent_id, []))
         except Exception:
             return 0
+
+    def close_position(self, agent_id: str, symbol: str, direction: Optional[str] = None) -> None:
+        """Remove a position from the registry when it closes (TP/SL hit or manually closed)."""
+        try:
+            with self.lock:
+                current: Dict = {}
+                if self.state_path.exists() and self.state_path.stat().st_size > 0:
+                    try:
+                        with open(self.state_path, "r") as f:
+                            current = json.load(f)
+                    except json.JSONDecodeError:
+                        current = {}
+
+                registry: Dict = current.get("position_registry", {})
+                positions: list = registry.get(agent_id, [])
+                before = len(positions)
+
+                if direction:
+                    positions = [p for p in positions
+                                 if not (p.get("symbol") == symbol
+                                         and p.get("direction") == direction)]
+                else:
+                    positions = [p for p in positions if p.get("symbol") != symbol]
+
+                removed = before - len(positions)
+                registry[agent_id] = positions
+                current["position_registry"] = registry
+
+                tmp = self.state_path.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(current, f, indent=2)
+                tmp.replace(self.state_path)
+                logger.info("position_closed",
+                            agent=agent_id, symbol=symbol, removed=removed)
+        except Exception as e:
+            logger.error("close_position_error", error=str(e))
 
     def write_augur_state(self, augur: AugurState) -> None:
         self._update_section("augur", asdict(augur))
@@ -398,6 +432,57 @@ class KingdomStateSync:
             }
         except Exception:
             return None
+
+    # ── DeepSeek whisper — ambient intelligence for both agents ─────────────
+
+    def write_deepseek_whisper(self, observations: List[Dict]) -> None:
+        """
+        Write DeepSeek ambient observations into kingdom state.
+        Stored at kingdom["deepseek_whisper"] — readable by both ARIA and AUGUR.
+        Does NOT overwrite either agent's internal signals; it feeds the probability loop.
+        Each observation: {symbol, bias, strength, reason, expires_ms}
+        """
+        try:
+            now_ms = int(time.time() * 1000)
+            self._update_section("deepseek_whisper", {
+                "observations": observations,
+                "updated_ms":   now_ms,
+                "expires_ms":   now_ms + 6 * 3600 * 1000,  # 6h TTL
+            })
+            logger.debug("deepseek_whisper_written", count=len(observations))
+        except Exception as e:
+            logger.error("deepseek_whisper_write_error", error=str(e))
+
+    def read_deepseek_whisper(self) -> List[Dict]:
+        """
+        Read DeepSeek ambient observations. Returns empty list if missing or expired.
+        Both ARIA and AUGUR can call this to read ambient market intelligence.
+        """
+        try:
+            with self.lock:
+                if not self.state_path.exists():
+                    return []
+                with open(self.state_path, "r") as f:
+                    data = json.load(f)
+            whisper = data.get("deepseek_whisper", {})
+            if not whisper:
+                return []
+            if whisper.get("expires_ms", 0) < int(time.time() * 1000):
+                return []
+            return whisper.get("observations", [])
+        except Exception:
+            return []
+
+    def get_deepseek_bias(self, symbol: str) -> Optional[Dict]:
+        """
+        Get DeepSeek's directional bias for a specific symbol.
+        Returns None if no observation or expired.
+        Used by AUGUR's kant_score boost and ARIA's coherence modifier.
+        """
+        for obs in self.read_deepseek_whisper():
+            if obs.get("symbol") == symbol:
+                return obs
+        return None
 
     # ── Internal ────────────────────────────────────────────────────────────
 
