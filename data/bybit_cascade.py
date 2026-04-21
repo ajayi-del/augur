@@ -247,12 +247,12 @@ class BybitCascadeEngine:
             await self._stream()  # Recursive retry
 
     async def _bybit_stream(self) -> None:
-        """Bybit liquidation stream with individual symbol validation."""
+        """Bybit per-symbol liquidation stream (liquidation.{symbol} topics)."""
         bybit_symbols = list(_SYMBOL_MAP.values())
-        logger.info("bybit_cascade_connecting", 
-                   symbols_count=len(bybit_symbols),
-                   all_symbols=bybit_symbols)
-        
+        logger.info("bybit_cascade_connecting",
+                    symbols_count=len(bybit_symbols),
+                    all_symbols=bybit_symbols)
+
         async with websockets.connect(
             _BYBIT_WS_URL,
             ping_interval=10,
@@ -260,48 +260,39 @@ class BybitCascadeEngine:
             close_timeout=5,
         ) as ws:
             logger.info("bybit_cascade_connected", url=_BYBIT_WS_URL)
-            
-            # Subscribe to allLiquidation stream (market-wide)
-            try:
-                logger.info("bybit_cascade_subscribing_all_liquidations")
-                subscribe_msg = {
-                    "op": "subscribe",
-                    "args": ["allLiquidation"]
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                
-                # Wait for subscription response
-                response = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                data = json.loads(response)
-                
-                if data.get("success"):
-                    logger.info("bybit_cascade_all_liquidations_subscribed", 
-                               response=data)
-                else:
-                    logger.error("bybit_cascade_all_liquidations_rejected", 
-                                response=data)
-                    return
-                    
-            except asyncio.TimeoutError:
-                logger.error("bybit_cascade_all_liquidations_timeout")
-                return
-            except json.JSONDecodeError as e:
-                logger.error("bybit_cascade_all_liquidations_decode_error", 
-                            error=str(e))
-                return
-            except Exception as e:
-                logger.error("bybit_cascade_all_liquidations_error", 
-                            error=str(e))
-                return
-            
+
+            # Subscribe per-symbol (Bybit supports liquidation.{symbol}, not allLiquidation)
+            # Batch into chunks of 10 to stay within the subscribe limit per message
+            chunk_size = 10
+            subscribed = 0
+            for i in range(0, len(bybit_symbols), chunk_size):
+                chunk = bybit_symbols[i:i + chunk_size]
+                topics = [f"liquidation.{s}" for s in chunk]
+                await ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                try:
+                    resp_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    resp = json.loads(resp_raw)
+                    if resp.get("success"):
+                        subscribed += len(chunk)
+                    else:
+                        logger.warning("bybit_cascade_chunk_rejected",
+                                       topics=topics, response=resp)
+                except asyncio.TimeoutError:
+                    logger.warning("bybit_cascade_chunk_timeout", topics=topics)
+
+            if subscribed == 0:
+                raise RuntimeError("bybit_cascade: no per-symbol subscriptions confirmed")
+
+            logger.info("bybit_cascade_per_symbol_subscribed",
+                        subscribed=subscribed, total=len(bybit_symbols))
+
             # Start message queue and processor
             message_queue = asyncio.Queue(maxsize=1000)
-            
-            # Start parallel tasks
-            receiver_task = asyncio.create_task(self._message_receiver(ws, message_queue))
+
+            receiver_task  = asyncio.create_task(self._message_receiver(ws, message_queue))
             processor_task = asyncio.create_task(self._message_processor(message_queue))
             keepalive_task = asyncio.create_task(self._keepalive(ws))
-            
+
             try:
                 await asyncio.gather(receiver_task, processor_task, keepalive_task)
             except Exception as e:
@@ -447,18 +438,9 @@ class BybitCascadeEngine:
                 data = json.loads(msg)
                 topic = data.get("topic", "")
                 
-                # Handle allLiquidation stream
-                if topic == "allLiquidation":
-                    liq_data = data.get("data", {})
-                    symbol = liq_data.get("symbol", "")
-                    
-                    # Only process ARIA universe symbols
-                    if symbol in _ARIA_UNIVERSE_BYBIT.values():
-                        await self._on_liquidation(data)
-                    else:
-                        logger.debug("bybit_liquidation_filtered", 
-                                    reason="not_in_aria_universe",
-                                    symbol=symbol)
+                # Handle per-symbol liquidation topics: liquidation.{SYMBOL}
+                if topic.startswith("liquidation."):
+                    await self._on_liquidation(data)
                     
             except asyncio.TimeoutError:
                 logger.debug("bybit_processor_queue_timeout")
