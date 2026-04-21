@@ -38,6 +38,7 @@ from data.valuechain_bridge import ValueChainBridge
 from data.solana_bridge import SolanaBridge
 from data.bybit_feed import BybitFeed
 from data.bybit_cascade import BybitCascadeEngine
+from data.solana_liq_feed import LiquidationFeedManager
 from kingdom.state_sync import KingdomStateSync, AugurState, AgentBet
 from kingdom.chancellor import Chancellor
 from intelligence.prediction_market import CrossAgentBetEngine
@@ -153,6 +154,12 @@ class AugurApplication:
             chancellor=self.chancellor,
             router=self.router,
             base_trade_usd=cfg.base_trade_usd,
+        )
+
+        # Solana liquidation sources - Drift + Pyth velocity
+        self.liquidation_manager = LiquidationFeedManager(
+            kingdom=self.kingdom,
+            bybit_cascade_engine=self.bybit_cascade,
         )
 
         # Strategy runner — PERP_CASCADE + PERP_MOMENTUM, 30s cycle
@@ -817,6 +824,7 @@ class AugurApplication:
                 self.valuechain_loop(),
                 self.bybit_feed.start(),
                 self.bybit_cascade.start(),
+                self.liquidation_manager.start(),
                 self.augur_signal_loop(),
                 self.kingdom_sync_loop(),
                 self.outcome_resolver.resolve_loop(),
