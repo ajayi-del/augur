@@ -30,7 +30,6 @@ SYMBOLS = [
 ]
 
 _MIN_SIZE_USD = 10.0
-_MAX_SIZE_USD = 200.0
 
 
 class StrategyRunner:
@@ -186,7 +185,7 @@ class StrategyRunner:
         # Floor at $10 so AUGUR scales from minimal balance upward
         kelly_base = signal.edge * balance * signal.size_fraction
         final_size = kelly_base * decision.size_modifier
-        final_size = round(max(min(final_size, _MAX_SIZE_USD), _MIN_SIZE_USD), 2)
+        final_size = round(max(final_size, _MIN_SIZE_USD), 2)
 
         # TP from mark price — CASCADE 1.5%, MOMENTUM 2.0%
         mark = self.bybit_feed.get_mark_price(symbol)
