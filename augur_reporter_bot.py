@@ -123,27 +123,30 @@ def generate_hot_signal_alert(signal: dict) -> str:
             f"conviction={conv:.2f}  lev={lev}x\n"
             f"_{reas}_")
 
-# ─── Signal monitor (polls hot_signals.json for new signals) ─────────────────
-_seen_signals: set = set()
+# ─── Signal monitor ──────────────────────────────────────────────────────────
+# Key: "SYMBOL:direction" → epoch seconds of last alert.
+# Only fires once per 30 min per symbol+direction, regardless of expires_ms churn.
+_HOT_COOLDOWN_S = 1800  # 30 minutes
+_last_alerted: dict = {}  # "SYMBOL:direction" -> last_alert_epoch
 
 def _poll_hot_signals():
-    global _seen_signals
+    global _last_alerted
     try:
-        raw = Path(_AUGUR_HOT).read_text()
+        raw  = Path(_AUGUR_HOT).read_text()
         data = json.loads(raw)
         sigs = data.get("signals", [])
-        now_ms = int(time.time() * 1000)
+        now  = time.time()
+        now_ms = int(now * 1000)
         for s in sigs:
-            sid = s.get("symbol", "") + s.get("direction", "") + str(s.get("expires_ms", 0))
-            if sid not in _seen_signals and s.get("expires_ms", 0) > now_ms:
-                _seen_signals.add(sid)
-                alert = generate_hot_signal_alert(s)
-                tg(CHAT_ID, alert)
-                log(f"[hot alert] {s.get('symbol')} {s.get('direction')}")
-        # prune expired from seen set
-        _seen_signals = {sid for sid in _seen_signals
-                         if any(sid.endswith(str(s.get("expires_ms", 0))) and s.get("expires_ms", 0) > now_ms
-                                for s in sigs)}
+            if s.get("expires_ms", 0) <= now_ms:
+                continue  # expired
+            key = f"{s.get('symbol','')}:{s.get('direction','')}"
+            last = _last_alerted.get(key, 0)
+            if now - last < _HOT_COOLDOWN_S:
+                continue  # already alerted within cooldown window
+            _last_alerted[key] = now
+            tg(CHAT_ID, generate_hot_signal_alert(s))
+            log(f"[hot alert] {s.get('symbol')} {s.get('direction')}")
     except Exception:
         pass
 
