@@ -336,7 +336,7 @@ class StrategyRunner:
             aria_direction            = aria_dir,
             aria_coherence            = aria_coh,
             augur_direction           = signal.direction,
-            augur_conviction          = signal.confidence,
+            augur_conviction          = signal.confidence * 10.0,  # normalised 0-10 to match ARIA coherence scale
             aria_drawdown             = daily_loss,   # AUGUR tracks own P&L, not ARIA balance
             daily_loss_pct            = daily_loss,
             cascade_zscore            = signal.cascade_zscore,
@@ -361,9 +361,12 @@ class StrategyRunner:
         if not decision.augur_executes:
             return False
 
-        if balance < _MIN_SIZE_USD:
+        effective_notional = balance * final_leverage
+        if effective_notional < _MIN_SIZE_USD:
             logger.info("strategy_insufficient_balance",
-                        symbol=symbol, balance=round(balance, 2), min_required=_MIN_SIZE_USD)
+                        symbol=symbol, balance=round(balance, 2),
+                        leverage=final_leverage, effective=round(effective_notional, 2),
+                        min_required=_MIN_SIZE_USD)
             return False
 
         # Dynamic Kelly sizing with intel multiplier

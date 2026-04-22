@@ -148,10 +148,12 @@ class Chancellor:
         augur_dir:  Optional[str],
         augur_conv: float,
     ) -> Agreement:
+        # Both scores are on 0-10 scale (ARIA coherence native; AUGUR conviction * 10).
+        # combined = average → 0-10. Threshold 7.0 strong, below = weak.
         if aria_dir and augur_dir:
             if aria_dir == augur_dir:
-                combined = (aria_coh / 10.0) + augur_conv
-                return (Agreement.COMPOUND_STRONG if combined > 1.40
+                combined = (aria_coh + augur_conv) / 2.0
+                return (Agreement.COMPOUND_STRONG if combined > 7.0
                         else Agreement.COMPOUND_WEAK)
             return Agreement.CONFLICT
 
@@ -159,7 +161,7 @@ class Chancellor:
             return (Agreement.SINGLE_ARIA_STRONG if aria_coh > 7.0
                     else Agreement.SINGLE_ARIA_WEAK)
         if augur_dir:
-            return (Agreement.SINGLE_AUGUR_STRONG if augur_conv > 0.60
+            return (Agreement.SINGLE_AUGUR_STRONG if augur_conv > 6.0
                     else Agreement.SINGLE_AUGUR_WEAK)
         return Agreement.NONE
 

@@ -704,7 +704,7 @@ class AugurApplication:
                         # Pull AUGUR's current conviction on this symbol
                         augur_bets = self.bet_engine.get_active_bets(aria_bet.symbol)
                         augur_bet  = augur_bets.get("augur")
-                        augur_conv = augur_bet.confidence if augur_bet else 0.0
+                        augur_conv = (augur_bet.confidence * 10.0) if augur_bet else 0.0  # normalised 0-10, matches ARIA coherence scale
                         augur_dir  = augur_bet.direction  if augur_bet else None
 
                         total_exp, sym_exp = self._get_exposure_pcts(aria_bet.symbol)
